@@ -1,0 +1,12 @@
+{
+  "name": "fragrance-sync",
+  "version": "1.0.0",
+  "description": "Bloom Fragrances USA - Cosmopolitan to Shopify sync",
+  "main": "sync.js",
+  "scripts": {
+    "start": "node sync.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
