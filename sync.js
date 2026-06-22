@@ -38,27 +38,15 @@ function request(options, body = null) {
   });
 }
 
-// Get a fresh Shopify access token (valid ~24 hours)
+// Get Shopify access token directly from environment variable
 async function getShopifyToken() {
   console.log("🔑 Getting Shopify access token...");
-  const res = await request(
-    {
-      hostname: SHOPIFY_STORE,
-      path: "/admin/oauth/access_token",
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    },
-    {
-      grant_type: "client_credentials",
-      client_id: SHOPIFY_CLIENT_ID,
-      client_secret: SHOPIFY_CLIENT_SECRET,
-    }
-  );
-  if (!res.body.access_token) {
-    throw new Error("Failed to get Shopify token: " + JSON.stringify(res.body));
+  const token = process.env.SHOPIFY_TOKEN;
+  if (!token) {
+    throw new Error("SHOPIFY_TOKEN environment variable is not set!");
   }
   console.log("✅ Shopify token obtained");
-  return res.body.access_token;
+  return token;
 }
 
 // Fetch all fragrance products from Cosmopolitan (paginated)
