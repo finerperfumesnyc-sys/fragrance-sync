@@ -189,6 +189,7 @@ const server = http.createServer(async (req, res) => {
       const host = `https://${req.headers.host}`;
       SHOPIFY_TOKEN = await exchangeCodeForToken(code, host);
       console.log("✅ Shopify OAuth complete! Token received.");
+      console.log("🔑 SAVE THIS TOKEN TO RENDER ENV: " + SHOPIFY_TOKEN);
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(`<h1>✅ Connected!</h1><p>Your Shopify store is now connected. Sync will start automatically every 6 hours.</p><p><a href="/">Go back</a></p>`);
       // Run first sync immediately
