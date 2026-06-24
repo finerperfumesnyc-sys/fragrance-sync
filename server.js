@@ -1,14 +1,13 @@
-
 /**
  * Bloom Fragrances USA - Shopify OAuth + Sync Server
  * 1. Handles Shopify OAuth to get a real access token
  * 2. Runs product/inventory/order sync on a schedule
  */
- 
+
 const https = require("https");
 const http = require("http");
 const url = require("url");
- 
+
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 const COSMO_TOKEN = process.env.COSMO_TOKEN;
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE; // izt0qr-mh.myshopify.com
@@ -16,9 +15,9 @@ const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const PORT = process.env.PORT || 3000;
 const MARKUP = 20;
- 
+
 let SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
- 
+
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 function request(options, body = null) {
   return new Promise((resolve, reject) => {
@@ -35,14 +34,14 @@ function request(options, body = null) {
     req.end();
   });
 }
- 
+
 // ─── OAUTH ──────────────────────────────────────────────────────────────────
 function getInstallUrl(host) {
   const scopes = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory,read_fulfillments,write_fulfillments,read_customers,write_customers";
   const redirectUri = `${host}/auth/callback`;
   return `https://${SHOPIFY_STORE}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(redirectUri)}`;
 }
- 
+
 async function exchangeCodeForToken(code, host) {
   const body = `client_id=${SHOPIFY_CLIENT_ID}&client_secret=${SHOPIFY_CLIENT_SECRET}&code=${code}`;
   const res = await new Promise((resolve, reject) => {
@@ -62,7 +61,7 @@ async function exchangeCodeForToken(code, host) {
   });
   return res.body.access_token;
 }
- 
+
 // ─── SYNC FUNCTIONS ─────────────────────────────────────────────────────────
 async function fetchCosmoProducts() {
   let products = [];
@@ -75,12 +74,12 @@ async function fetchCosmoProducts() {
   }
   return products;
 }
- 
+
 async function fetchCosmoProductDetail(itemCode) {
   const res = await request({ hostname: "api.cosmopolitanusa.com", path: `/v1/products/${encodeURIComponent(itemCode)}`, method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } });
   return res.status === 200 ? res.body : null;
 }
- 
+
 async function getShopifyProducts() {
   const res = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/products.json?limit=250&fields=id,variants,tags", method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
   const products = res.body.products || [];
@@ -88,7 +87,7 @@ async function getShopifyProducts() {
   for (const p of products) for (const v of p.variants || []) if (v.sku) skuMap[v.sku] = { productId: p.id, variantId: v.id };
   return skuMap;
 }
- 
+
 async function createShopifyProduct(detail) {
   const price = (parseFloat(detail.Net) + MARKUP).toFixed(2);
   const comparePrice = detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null;
@@ -96,7 +95,7 @@ async function createShopifyProduct(detail) {
     { product: { title: detail.Desc, body_html: [detail.Desc2, detail.Desc3].filter(Boolean).join("<br>"), vendor: detail.Designer || "Cosmopolitan Cosmetics", product_type: "Fragrance", tags: ["fragrance", detail.ProductLine, detail.ProductClass].filter(Boolean).join(", "), images: detail.ImageURL ? [{ src: detail.ImageURL }] : [], variants: [{ sku: detail.Item, price, compare_at_price: comparePrice, inventory_management: "shopify", inventory_quantity: detail.Available || 0, weight: detail.Weight || 0, weight_unit: "oz", fulfillment_service: "manual", requires_shipping: true, taxable: true }] } });
   return res.status === 201 ? res.body.product : null;
 }
- 
+
 async function updateShopifyInventory(variantId, available) {
   const varRes = await request({ hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
   const inventoryItemId = varRes.body?.variant?.inventory_item_id;
@@ -106,7 +105,7 @@ async function updateShopifyInventory(variantId, available) {
   if (!locationId) return;
   await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/inventory_levels/set.json", method: "POST", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } }, { location_id: locationId, inventory_item_id: inventoryItemId, available });
 }
- 
+
 async function processOrders() {
   const res = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/orders.json?fulfillment_status=unfulfilled&status=open&limit=50", method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
   const orders = res.body.orders || [];
@@ -124,7 +123,7 @@ async function processOrders() {
   const today = new Date().toISOString().split("T")[0].replace(/-/g, "");
   await request({ hostname: "api.cosmopolitanusa.com", path: "/v1/dropship", method: "POST", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } }, { PO: `BLOOM-PO-${today}`, Comment: "Bloom Fragrances USA daily order" });
 }
- 
+
 async function syncTracking() {
   const res = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/orders.json?fulfillment_status=unfulfilled&status=open&limit=50", method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
   const orders = (res.body.orders || []).filter(o => (o.tags || "").includes("cosmo-submitted") && !(o.tags || "").includes("cosmo-tracked"));
@@ -146,7 +145,7 @@ async function syncTracking() {
     await new Promise(r => setTimeout(r, 500));
   }
 }
- 
+
 async function runSync() {
   if (!SHOPIFY_TOKEN) { console.log("⚠️ No Shopify token yet — visit /install to authenticate"); return; }
   console.log("🌸 Bloom Fragrances USA - Sync starting...", new Date().toISOString());
@@ -168,12 +167,12 @@ async function runSync() {
     console.log("🌸 Sync complete!");
   } catch (err) { console.error("❌ Sync error:", err.message); }
 }
- 
+
 // ─── WEB SERVER ─────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   const parsed = url.parse(req.url, true);
   const path = parsed.pathname;
- 
+
   if (path === "/") {
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(`<h1>🌸 Bloom Fragrances USA Sync</h1><p>Status: ${SHOPIFY_TOKEN ? "✅ Connected to Shopify" : "⚠️ Not connected"}</p>${!SHOPIFY_TOKEN ? '<a href="/install"><button>Connect to Shopify</button></a>' : '<p>Sync runs every 6 hours automatically.</p>'}`);
@@ -209,12 +208,11 @@ const server = http.createServer(async (req, res) => {
     res.end("Not found");
   }
 });
- 
+
 server.listen(PORT, () => {
   console.log(`🌸 Bloom Fragrances USA server running on port ${PORT}`);
   // Run sync every 6 hours
-  setInterval(runSync, 6 * 60 * 60 * 1000);
+  setInterval(runSync, 30 * 60 * 1000);
   // Run once on startup if token exists
   if (SHOPIFY_TOKEN) setTimeout(runSync, 5000);
 });
- 
