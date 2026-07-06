@@ -37,6 +37,20 @@ function request(options, body = null) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Retry wrapper - retries failed API calls up to 3 times
+async function withRetry(fn, retries = 3, delayMs = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const result = await fn();
+      return result;
+    } catch (err) {
+      console.log(`⚠️ Attempt ${i+1} failed: ${err.message}. ${i < retries-1 ? "Retrying..." : "Giving up."}`);
+      if (i < retries - 1) await sleep(delayMs * (i + 1));
+    }
+  }
+  return null;
+}
+
 function loadProgress() {
   try {
     if (fs.existsSync(PROGRESS_FILE)) return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8"));
@@ -73,7 +87,13 @@ function extractGender(title) {
 function extractSize(title) {
   if (!title) return null;
   const match = title.match(/(\d+\.?\d*)\s*OZ/i);
-  return match ? `${match[1]} oz` : null;
+  if (!match) return null;
+  const size = `${match[1]} oz`;
+  // Label testers clearly — exclude slightly damaged
+  const isTester = /TESTER|NO CAP|UNBOXED/i.test(title);
+  const isDamaged = /SLIGHTLY DAMAGED/i.test(title);
+  if (isDamaged) return null; // skip damaged products entirely
+  return isTester ? `${size} (Tester)` : size;
 }
 
 function extractProductType(title) {
@@ -115,7 +135,11 @@ function buildProductTitle(details) {
   const productType = extractProductType(first.Desc || "");
   const gender = extractGender(first.Desc || "");
   const genderLabel = gender === "M" ? "for Men" : gender === "W" ? "for Women" : "Unisex";
-  return `${fragName} ${productType} by ${designer} ${genderLabel}`.replace(/\s+/g, " ").trim();
+  // Clean title - no spray, no duplicate words
+  let title = `${designer} ${fragName} ${productType} ${genderLabel}`;
+  title = title.replace(/Spray/gi, "");
+  title = title.replace(/\s+/g, " ").trim();
+  return title;
 }
 
 function buildDescription(details) {
@@ -125,8 +149,13 @@ function buildDescription(details) {
   const productType = extractProductType(first.Desc || "");
   const gender = extractGender(first.Desc || "");
   const genderWord = gender === "M" ? "men's" : gender === "W" ? "women's" : "unisex";
-  const sizes = [...new Set(details.map(d => extractSize(d.Desc || "")).filter(Boolean))].sort((a,b) => parseFloat(a) - parseFloat(b)).join(", ");
-  return `<p>${fragName} ${productType} by ${designer}. A sophisticated ${genderWord} fragrance, available in ${sizes || "multiple sizes"}.</p>`;
+  const sizes = [...new Set(details.map(d => extractSize(d.Desc || "")).filter(Boolean))].sort((a,b) => parseFloat(a) - parseFloat(b)).filter(s => !s.includes("Tester")).join(", ");
+  const typeExplain = productType === "Eau de Parfum" ? " Eau de Parfum offers a rich, long-lasting scent that lingers throughout the day." 
+    : productType === "Eau de Toilette" ? " Eau de Toilette is a lighter, fresh concentration perfect for everyday wear."
+    : productType === "Cologne" ? " A light, refreshing concentration ideal for daily use."
+    : productType === "Parfum" ? " Parfum is the most concentrated and longest-lasting fragrance formulation."
+    : "";
+  return `<p>${designer} ${fragName} ${productType} — a sophisticated ${genderWord} fragrance available in ${sizes || "multiple sizes"}.${typeExplain}</p>`;
 }
 
 // ─── OAUTH ───────────────────────────────────────────────────────────────────
@@ -206,7 +235,14 @@ async function createShopifyProduct(groupDetails) {
   const description = buildDescription(groupDetails);
   const imageUrl = groupDetails.find(d => d.ImageURL)?.ImageURL?.trim().replace("http://", "https://");
 
-  const variants = groupDetails.map(detail => {
+  // Sort by size smallest to largest
+  const sortedDetails = [...groupDetails].sort((a, b) => {
+    const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
+    const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
+    return sizeA - sizeB;
+  });
+
+  const variants = sortedDetails.map(detail => {
     const size = extractSize(detail.Desc || "") || "One Size";
     return {
       option1: size,
@@ -419,86 +455,77 @@ async function runSync(fullReset = false) {
     }
     console.log(`✅ Total: ${allItems.length} items from Cosmopolitan`);
 
-    // Second pass: fetch details in batches of 50, group, and create products
-    const BATCH = 50;
+    // Second pass: fetch ALL details first, group completely, THEN create products
     const groups = {}; // groupKey -> [details]
     const seenProductLines = new Set();
 
-    for (let i = 0; i < allItems.length; i += BATCH) {
-      const batch = allItems.slice(i, i + BATCH);
-      console.log(`🔍 Fetching details for items ${i+1}-${Math.min(i+BATCH, allItems.length)}/${allItems.length}...`);
+    console.log("🔍 Phase 1: Fetching all product details and grouping...");
+    for (let i = 0; i < allItems.length; i++) {
+      const item = allItems[i];
 
-      for (const item of batch) {
-        // Skip already processed SKUs (inventory update only)
-        if (skuMap[item.Item]) {
-          await updateInventory(skuMap[item.Item].variantId, item.Available || 0, locationId);
-          totalUpdated++;
-          await sleep(200);
-          continue;
-        }
-
-        const detail = await fetchCosmoDetail(item.Item);
-        if (!detail) continue;
-        if (detail.ProductLine) seenProductLines.add(detail.ProductLine);
-        if (!allowedLines.includes(detail.ProductLine)) continue;
-
-        const key = buildGroupKey(detail);
-        if (!groups[key]) groups[key] = [];
-        groups[key].push(detail);
-        await sleep(250);
+      // Skip already processed SKUs (inventory update only)
+      if (skuMap[item.Item]) {
+        await updateInventory(skuMap[item.Item].variantId, item.Available || 0, locationId);
+        totalUpdated++;
+        await sleep(150);
+        continue;
       }
 
-      // After each batch, create any complete groups
-      // A group is "complete enough" if we've seen all its items
-      // We'll create groups that have at least 1 item
-      for (const [key, groupDetails] of Object.entries(groups)) {
-        if (processedGroups[key]) {
-          // Already created — just update inventory
-          continue;
-        }
+      const detail = await withRetry(() => fetchCosmoDetail(item.Item));
+      if (!detail) continue;
+      if (detail.ProductLine) seenProductLines.add(detail.ProductLine);
+      if (!allowedLines.includes(detail.ProductLine)) continue;
 
-        // Check if any SKU in this group now exists in Shopify (from previous sync)
-        const existingInShopify = groupDetails.find(d => skuMap[d.Item]);
-        if (existingInShopify) {
-          const productId = skuMap[existingInShopify.Item].productId;
-          for (const detail of groupDetails) {
-            if (!skuMap[detail.Item]) {
-              await addVariantToProduct(productId, detail);
-              await sleep(300);
-            }
-          }
-          processedGroups[key] = productId;
-          totalUpdated++;
-        } else {
-          const created = await createShopifyProduct(groupDetails);
-          if (created) {
-            processedGroups[key] = created.id;
-            // Update skuMap for new variants
-            for (const v of created.variants || []) {
-              if (v.sku) skuMap[v.sku] = { productId: created.id, variantId: v.id };
-            }
-            totalCreated++;
-          }
-          await sleep(400);
-        }
+      const key = buildGroupKey(detail);
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(detail);
 
-        delete groups[key]; // free memory
+      if (i % 100 === 0) {
+        console.log(`📋 ${i+1}/${allItems.length} items processed, ${Object.keys(groups).length} groups so far`);
+        saveProgress({ processedGroups, lastPageProcessed: 1 });
       }
-
-      // Save progress after each batch
-      saveProgress({ processedGroups, lastPageProcessed: page });
-      console.log(`💾 Progress: ${totalCreated} created, ${totalUpdated} updated`);
+      await sleep(250);
     }
 
-    // Final pass: create any remaining groups
-    for (const [key, groupDetails] of Object.entries(groups)) {
+    console.log(`📦 Phase 1 complete! ${Object.keys(groups).length} unique fragrances found`);
+    console.log(`📋 Product lines: ${Array.from(seenProductLines).join(", ")}`);
+
+    // Phase 2: Create all grouped products
+    console.log("🛍️ Phase 2: Creating grouped products in Shopify...");
+    const groupKeys = Object.keys(groups);
+    for (let g = 0; g < groupKeys.length; g++) {
+      const key = groupKeys[g];
+      const groupDetails = groups[key];
+
       if (processedGroups[key]) continue;
-      const created = await createShopifyProduct(groupDetails);
-      if (created) {
-        totalCreated++;
-        processedGroups[key] = created.id;
+
+      const existingInShopify = groupDetails.find(d => skuMap[d.Item]);
+      if (existingInShopify) {
+        const productId = skuMap[existingInShopify.Item].productId;
+        for (const detail of groupDetails) {
+          if (!skuMap[detail.Item]) {
+            await addVariantToProduct(productId, detail);
+            await sleep(300);
+          }
+        }
+        processedGroups[key] = productId;
+        totalUpdated++;
+      } else {
+        const created = await withRetry(() => createShopifyProduct(groupDetails));
+        if (created) {
+          processedGroups[key] = created.id;
+          for (const v of created.variants || []) {
+            if (v.sku) skuMap[v.sku] = { productId: created.id, variantId: v.id };
+          }
+          totalCreated++;
+        }
+        await sleep(600);
       }
-      await sleep(400);
+
+      if (g % 25 === 0) {
+        saveProgress({ processedGroups, lastPageProcessed: 1 });
+        console.log(`💾 Progress: ${g+1}/${groupKeys.length} groups, ${totalCreated} created`);
+      }
     }
 
     console.log(`\n📋 Product lines seen: ${Array.from(seenProductLines).join(", ")}`);
