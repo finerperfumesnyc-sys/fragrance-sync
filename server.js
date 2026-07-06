@@ -108,12 +108,8 @@ function extractProductType(title) {
 
 function extractFragranceName(title) {
   if (!title) return "";
-  let name = title.includes("/") ? title.split("/")[1] : title;
-  name = name.replace(/\d+\.?\d*\s*OZ(\s*\(\d+\s*ML\))?/gi, "");
-  name = name.replace(/\(\d+\s*ML\)/gi, "");
-  name = name.replace(/\s*\([MWUG]\)\s*/g, "");
-  name = name.replace(/\b(EDP|EDT|EDC|EAU DE PARFUM|EAU DE TOILETTE|PARFUM|COLOGNE|SPRAY|TESTER|NO CAP|UNBOXED|SLIGHTLY DAMAGED|SPLASH)\b/gi, "");
-  name = name.replace(/\s+/g, " ").trim();
+  // Cosmopolitan format: "FRAGRANCE NAME/DESIGNER REST" - take BEFORE the slash
+  const name = title.includes("/") ? title.split("/")[0].trim() : title.trim();
   return name.split(" ").map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : "").join(" ").trim();
 }
 
@@ -121,11 +117,10 @@ function buildGroupKey(detail) {
   const designer = (detail.Designer || "UNKNOWN").toUpperCase().trim();
   const gender = extractGender(detail.Desc || "");
   const productType = extractProductType(detail.Desc || "");
-  let base = (detail.Desc || detail.Item).toUpperCase();
-  base = base.replace(/\d+\.?\d*\s*OZ(\s*\(\d+\s*ML\))?/gi, "");
-  base = base.replace(/\(\d+\s*ML\)/gi, "");
-  base = base.replace(/\s+/g, " ").trim();
-  return `${designer}||${base}||${gender}`;
+  // Get fragrance name (before /) and strip size for grouping
+  const desc = (detail.Desc || detail.Item).toUpperCase();
+  const fragPart = desc.includes("/") ? desc.split("/")[0].trim() : desc;
+  return `${designer}||${fragPart}||${productType}||${gender}`;
 }
 
 function buildProductTitle(details) {
@@ -134,10 +129,14 @@ function buildProductTitle(details) {
   const fragName = extractFragranceName(first.Desc || first.Item);
   const productType = extractProductType(first.Desc || "");
   const gender = extractGender(first.Desc || "");
-  const genderLabel = gender === "M" ? "for Men" : gender === "W" ? "for Women" : "Unisex";
-  // Clean title - no spray, no duplicate words
-  let title = `${designer} ${fragName} ${productType} ${genderLabel}`;
-  title = title.replace(/Spray/gi, "");
+  const genderLabel = gender === "M" ? "for Men" : gender === "W" ? "for Women" : "";
+  // Avoid duplicate designer name
+  let cleanFragName = fragName;
+  if (cleanFragName.toUpperCase().startsWith(designer.toUpperCase())) {
+    cleanFragName = cleanFragName.slice(designer.length).trim();
+  }
+  let title = (designer + " " + cleanFragName + " " + productType + " " + genderLabel).trim();
+  title = title.replace(/\bSpray\b/gi, "");
   title = title.replace(/\s+/g, " ").trim();
   return title;
 }
