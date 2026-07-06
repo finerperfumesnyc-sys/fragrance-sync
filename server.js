@@ -1,7 +1,6 @@
 /**
  * Bloom Fragrances USA - Shopify OAuth + Sync Server
- * Features: OAuth, product variant grouping, smart pricing, clean descriptions,
- * image normalization, order submission, tracking sync
+ * Optimized: fetches details in batches, groups, creates products progressively
  */
 
 const https = require("https");
@@ -9,7 +8,6 @@ const http = require("http");
 const url = require("url");
 const fs = require("fs");
 
-// ─── CONFIG ─────────────────────────────────────────────────────────────────
 const COSMO_TOKEN = process.env.COSMO_TOKEN;
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
@@ -43,7 +41,7 @@ function loadProgress() {
   try {
     if (fs.existsSync(PROGRESS_FILE)) return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8"));
   } catch(e) {}
-  return { processedGroups: [] };
+  return { processedGroups: {}, lastPageProcessed: 0 };
 }
 
 function saveProgress(progress) {
@@ -54,7 +52,7 @@ function clearProgress() {
   try { if (fs.existsSync(PROGRESS_FILE)) fs.unlinkSync(PROGRESS_FILE); } catch(e) {}
 }
 
-// ─── FEATURE 2: SMART PRICING ────────────────────────────────────────────────
+// ─── PRICING ────────────────────────────────────────────────────────────────
 function calculatePrice(wholesale, retail) {
   const net = parseFloat(wholesale || 0);
   const ret = parseFloat(retail || 0);
@@ -63,33 +61,13 @@ function calculatePrice(wholesale, retail) {
   return Math.min(markupPrice, capPrice > 0 ? capPrice : markupPrice).toFixed(2);
 }
 
-// ─── FEATURE 3: CLEAN PRODUCT DESCRIPTIONS ──────────────────────────────────
-function buildDescription(details) {
-  // details is array of variants for one product group
-  const first = details[0];
-  const designer = first.Designer || "Designer";
-  const fragName = extractFragranceName(first.Desc || first.Item);
-  const productType = first.ProductClass || "Fragrance";
-  const gender = extractGender(first.Desc || "");
-  const sizes = details.map(d => extractSize(d.Desc || "")).filter(Boolean).join(", ");
-
-  const genderWord = gender === "M" ? "men's" : gender === "W" ? "women's" : "unisex";
-
-  return `<p>${fragName} ${productType} by ${designer}. A sophisticated ${genderWord} fragrance, available in ${sizes || "multiple sizes"}. An elegant addition to any collection.</p>`;
-}
-
-function extractFragranceName(title) {
-  if (!title) return title;
-  // Remove designer prefix (before /)
-  let name = title.includes("/") ? title.split("/")[1] : title;
-  // Remove size info like "3.4 OZ", "1.7 OZ (100 ML)"
-  name = name.replace(/\d+\.?\d*\s*OZ[^(]*/gi, "").replace(/\(\d+\s*ML\)/gi, "").trim();
-  // Remove gender markers
-  name = name.replace(/\s*\([MWU]\)\s*/g, "").trim();
-  // Remove product type words
-  name = name.replace(/\b(EDP|EDT|EDC|EAU DE PARFUM|EAU DE TOILETTE|PARFUM|COLOGNE|SPRAY|TESTER|NO CAP|UNBOXED)\b/gi, "").trim();
-  // Title case
-  return name.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ").trim();
+// ─── TEXT HELPERS ────────────────────────────────────────────────────────────
+function extractGender(title) {
+  if (!title) return "U";
+  if (title.includes("(M)")) return "M";
+  if (title.includes("(W)")) return "W";
+  if (title.includes("(U)")) return "U";
+  return "U";
 }
 
 function extractSize(title) {
@@ -98,57 +76,75 @@ function extractSize(title) {
   return match ? `${match[1]} oz` : null;
 }
 
-function extractGender(title) {
-  if (title.includes("(M)")) return "M";
-  if (title.includes("(W)")) return "W";
-  if (title.includes("(U)")) return "U";
-  return "U";
+function extractProductType(title) {
+  if (!title) return "Fragrance";
+  if (/EDP|EAU DE PARFUM/i.test(title)) return "Eau de Parfum";
+  if (/EDT|EAU DE TOILETTE/i.test(title)) return "Eau de Toilette";
+  if (/EDC|EAU DE COLOGNE/i.test(title)) return "Cologne";
+  if (/PARFUM/i.test(title)) return "Parfum";
+  if (/COLOGNE/i.test(title)) return "Cologne";
+  return "Fragrance";
 }
 
-function buildProductTitle(first) {
+function extractFragranceName(title) {
+  if (!title) return "";
+  let name = title.includes("/") ? title.split("/")[1] : title;
+  name = name.replace(/\d+\.?\d*\s*OZ(\s*\(\d+\s*ML\))?/gi, "");
+  name = name.replace(/\(\d+\s*ML\)/gi, "");
+  name = name.replace(/\s*\([MWUG]\)\s*/g, "");
+  name = name.replace(/\b(EDP|EDT|EDC|EAU DE PARFUM|EAU DE TOILETTE|PARFUM|COLOGNE|SPRAY|TESTER|NO CAP|UNBOXED|SLIGHTLY DAMAGED|SPLASH)\b/gi, "");
+  name = name.replace(/\s+/g, " ").trim();
+  return name.split(" ").map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : "").join(" ").trim();
+}
+
+function buildGroupKey(detail) {
+  const designer = (detail.Designer || "UNKNOWN").toUpperCase().trim();
+  const gender = extractGender(detail.Desc || "");
+  const productType = extractProductType(detail.Desc || "");
+  let base = (detail.Desc || detail.Item).toUpperCase();
+  base = base.replace(/\d+\.?\d*\s*OZ(\s*\(\d+\s*ML\))?/gi, "");
+  base = base.replace(/\(\d+\s*ML\)/gi, "");
+  base = base.replace(/\s+/g, " ").trim();
+  return `${designer}||${base}||${gender}`;
+}
+
+function buildProductTitle(details) {
+  const first = details[0];
   const designer = first.Designer || "";
   const fragName = extractFragranceName(first.Desc || first.Item);
   const productType = extractProductType(first.Desc || "");
   const gender = extractGender(first.Desc || "");
   const genderLabel = gender === "M" ? "for Men" : gender === "W" ? "for Women" : "Unisex";
-  return `${fragName} ${productType} by ${designer} ${genderLabel}`.trim();
+  return `${fragName} ${productType} by ${designer} ${genderLabel}`.replace(/\s+/g, " ").trim();
 }
 
-function extractProductType(title) {
-  if (/EDP|EAU DE PARFUM|PARFUM/i.test(title)) return "Eau de Parfum";
-  if (/EDT|EAU DE TOILETTE/i.test(title)) return "Eau de Toilette";
-  if (/EDC|EAU DE COLOGNE|COLOGNE/i.test(title)) return "Cologne";
-  return "Fragrance";
+function buildDescription(details) {
+  const first = details[0];
+  const designer = first.Designer || "Designer";
+  const fragName = extractFragranceName(first.Desc || first.Item);
+  const productType = extractProductType(first.Desc || "");
+  const gender = extractGender(first.Desc || "");
+  const genderWord = gender === "M" ? "men's" : gender === "W" ? "women's" : "unisex";
+  const sizes = [...new Set(details.map(d => extractSize(d.Desc || "")).filter(Boolean))].sort((a,b) => parseFloat(a) - parseFloat(b)).join(", ");
+  return `<p>${fragName} ${productType} by ${designer}. A sophisticated ${genderWord} fragrance, available in ${sizes || "multiple sizes"}.</p>`;
 }
 
-// ─── FEATURE 1: GROUP PRODUCTS BY FRAGRANCE ──────────────────────────────────
-function buildGroupKey(detail) {
-  const designer = (detail.Designer || "UNKNOWN").toUpperCase().trim();
-  const gender = extractGender(detail.Desc || "");
-  const fragName = extractFragranceName(detail.Desc || detail.Item).toUpperCase();
-  const productType = extractProductType(detail.Desc || "");
-  return `${designer}||${fragName}||${productType}||${gender}`;
-}
-
-// ─── OAUTH ──────────────────────────────────────────────────────────────────
+// ─── OAUTH ───────────────────────────────────────────────────────────────────
 function getInstallUrl(host) {
   const scopes = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory,read_fulfillments,write_fulfillments,read_customers,write_customers";
-  const redirectUri = `${host}/auth/callback`;
-  return `https://${SHOPIFY_STORE}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+  return `https://${SHOPIFY_STORE}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(`${host}/auth/callback`)}`;
 }
 
 async function exchangeCodeForToken(code, host) {
   const body = `client_id=${SHOPIFY_CLIENT_ID}&client_secret=${SHOPIFY_CLIENT_SECRET}&code=${code}`;
   const res = await new Promise((resolve, reject) => {
     const req = https.request({
-      hostname: SHOPIFY_STORE,
-      path: "/admin/oauth/access_token",
-      method: "POST",
+      hostname: SHOPIFY_STORE, path: "/admin/oauth/access_token", method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(body) }
     }, (res) => {
       let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(data) }));
+      res.on("data", c => data += c);
+      res.on("end", () => resolve({ body: JSON.parse(data) }));
     });
     req.on("error", reject);
     req.write(body);
@@ -158,65 +154,43 @@ async function exchangeCodeForToken(code, host) {
 }
 
 // ─── COSMOPOLITAN API ────────────────────────────────────────────────────────
-async function fetchAllCosmoItems() {
-  let allItems = [];
-  let page = 1;
-  while (true) {
-    console.log(`🔍 Fetching Cosmo page ${page}...`);
-    const res = await request({
-      hostname: "api.cosmopolitanusa.com",
-      path: `/v1/products?page=${page}`,
-      method: "GET",
-      headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
-    });
-    if (res.status !== 200 || !res.body || !res.body.Results || res.body.Results.length === 0) break;
-    allItems = allItems.concat(res.body.Results);
-    console.log(`📦 Page ${page}: ${res.body.Results.length} items, total: ${allItems.length}`);
-    if (!res.body.NextUrl) break;
-    page++;
-    await sleep(200);
-  }
-  console.log(`✅ Total items from Cosmopolitan: ${allItems.length}`);
-  return allItems;
+async function fetchCosmoPage(page) {
+  const res = await request({
+    hostname: "api.cosmopolitanusa.com", path: `/v1/products?page=${page}`,
+    method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
+  });
+  if (res.status !== 200 || !res.body || !res.body.Results) return { items: [], hasMore: false };
+  return { items: res.body.Results, hasMore: !!res.body.NextUrl };
 }
 
 async function fetchCosmoDetail(itemCode) {
   const res = await request({
-    hostname: "api.cosmopolitanusa.com",
-    path: `/v1/products/${encodeURIComponent(itemCode)}`,
-    method: "GET",
-    headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
+    hostname: "api.cosmopolitanusa.com", path: `/v1/products/${encodeURIComponent(itemCode)}`,
+    method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
   });
   return res.status === 200 ? res.body : null;
 }
 
 // ─── SHOPIFY API ─────────────────────────────────────────────────────────────
-async function getAllShopifyProducts() {
-  let productMap = {}; // groupKey -> shopify product id
-  let skuMap = {};     // sku -> { productId, variantId }
-  let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,variants,tags";
+async function getAllShopifySkus() {
+  let skuMap = {};
+  let path = "/admin/api/2024-01/products.json?limit=250&fields=id,variants";
   while (true) {
     const res = await request({
       hostname: SHOPIFY_STORE, path, method: "GET",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
     });
-    const products = res.body.products || [];
-    for (const p of products) {
-      for (const v of p.variants || []) {
-        if (v.sku) {
-          skuMap[v.sku] = { productId: p.id, variantId: v.id };
-        }
-      }
-    }
-    const link = res.headers && res.headers.link;
-    if (link && link.includes('rel="next"')) {
-      const match = link.match(/<([^>]+)>;\s*rel="next"/);
-      if (match) { path = match[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); }
-      else break;
+    for (const p of res.body.products || [])
+      for (const v of p.variants || [])
+        if (v.sku) skuMap[v.sku] = { productId: p.id, variantId: v.id };
+    const link = res.headers?.link || "";
+    if (link.includes('rel="next"')) {
+      const m = link.match(/<([^>]+)>;\s*rel="next"/);
+      if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break;
     } else break;
   }
   console.log(`🛍️ Existing Shopify SKUs: ${Object.keys(skuMap).length}`);
-  return { skuMap };
+  return skuMap;
 }
 
 async function getLocationId() {
@@ -227,35 +201,21 @@ async function getLocationId() {
   return res.body?.locations?.[0]?.id;
 }
 
-// ─── FEATURE 4: IMAGE URL NORMALIZATION ──────────────────────────────────────
-function normalizeImageUrl(imageUrl) {
-  if (!imageUrl) return null;
-  // Cosmopolitan images - ensure HTTPS and trim whitespace
-  let normalized = imageUrl.trim();
-  if (normalized.startsWith("http://")) normalized = normalized.replace("http://", "https://");
-  return normalized || null;
-}
-
-// ─── CREATE/UPDATE SHOPIFY PRODUCT WITH VARIANTS ─────────────────────────────
-async function createShopifyProductWithVariants(groupDetails) {
-  const first = groupDetails[0];
-  const title = buildProductTitle(first);
+async function createShopifyProduct(groupDetails) {
+  const title = buildProductTitle(groupDetails);
   const description = buildDescription(groupDetails);
-  const imageUrl = normalizeImageUrl(first.ImageURL);
+  const imageUrl = groupDetails.find(d => d.ImageURL)?.ImageURL?.trim().replace("http://", "https://");
 
-  // Build variants - one per size
   const variants = groupDetails.map(detail => {
-    const size = extractSize(detail.Desc || "") || detail.Desc;
-    const price = calculatePrice(detail.Net, detail.Retail);
-    const comparePrice = detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null;
+    const size = extractSize(detail.Desc || "") || "One Size";
     return {
       option1: size,
       sku: detail.Item,
-      price,
-      compare_at_price: comparePrice,
+      price: calculatePrice(detail.Net, detail.Retail),
+      compare_at_price: detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null,
       inventory_management: "shopify",
       inventory_quantity: detail.Available || 0,
-      weight: detail.Weight || 0,
+      weight: parseFloat(detail.Weight || 0),
       weight_unit: "oz",
       fulfillment_service: "manual",
       requires_shipping: true,
@@ -263,52 +223,41 @@ async function createShopifyProductWithVariants(groupDetails) {
     };
   });
 
-  const product = {
-    title,
-    body_html: description,
-    vendor: first.Designer || "Cosmopolitan Cosmetics",
-    product_type: extractProductType(first.Desc || ""),
-    tags: ["fragrance", first.ProductLine, first.ProductClass, extractGender(first.Desc || "")].filter(Boolean).join(", "),
-    options: [{ name: "Size" }],
-    variants,
-    images: imageUrl ? [{ src: imageUrl }] : []
-  };
-
   const res = await request(
     { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/products.json", method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { product }
+    { product: {
+        title, body_html: description,
+        vendor: groupDetails[0].Designer || "Cosmopolitan Cosmetics",
+        product_type: extractProductType(groupDetails[0].Desc || ""),
+        tags: ["fragrance", groupDetails[0].ProductLine, extractGender(groupDetails[0].Desc || "")].filter(Boolean).join(", "),
+        options: [{ name: "Size" }],
+        variants,
+        images: imageUrl ? [{ src: imageUrl }] : []
+      }
+    }
   );
 
   if (res.status === 201) {
-    console.log(`✅ Created with ${variants.length} size(s): ${title}`);
+    console.log(`✅ Created: ${title} (${variants.length} size${variants.length > 1 ? "s" : ""})`);
     return res.body.product;
-  } else {
-    console.log(`⚠️ Failed to create: ${title}`, JSON.stringify(res.body).slice(0, 200));
-    return null;
   }
+  console.log(`⚠️ Failed: ${title} — ${JSON.stringify(res.body).slice(0, 150)}`);
+  return null;
 }
 
 async function addVariantToProduct(productId, detail) {
-  const size = extractSize(detail.Desc || "") || detail.Desc;
-  const price = calculatePrice(detail.Net, detail.Retail);
-  const comparePrice = detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null;
-
+  const size = extractSize(detail.Desc || "") || "One Size";
   const res = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}/variants.json`, method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
     { variant: {
-        option1: size,
-        sku: detail.Item,
-        price,
-        compare_at_price: comparePrice,
-        inventory_management: "shopify",
-        inventory_quantity: detail.Available || 0,
-        weight: detail.Weight || 0,
-        weight_unit: "oz",
-        fulfillment_service: "manual",
-        requires_shipping: true,
-        taxable: true
+        option1: size, sku: detail.Item,
+        price: calculatePrice(detail.Net, detail.Retail),
+        compare_at_price: detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null,
+        inventory_management: "shopify", inventory_quantity: detail.Available || 0,
+        weight: parseFloat(detail.Weight || 0), weight_unit: "oz",
+        fulfillment_service: "manual", requires_shipping: true, taxable: true
       }
     }
   );
@@ -329,7 +278,7 @@ async function updateInventory(variantId, available, locationId) {
   );
 }
 
-// ─── ORDER PROCESSING ─────────────────────────────────────────────────────────
+// ─── ORDERS ──────────────────────────────────────────────────────────────────
 async function processOrders() {
   const res = await request({
     hostname: SHOPIFY_STORE,
@@ -348,9 +297,9 @@ async function processOrders() {
       ShipTo: {
         Name: `${shipping.first_name} ${shipping.last_name}`.trim(),
         Line1: shipping.address1, Line2: shipping.address2 || undefined,
-        City: shipping.city, State: shipping.province_code,
-        Zip: shipping.zip, Country: shipping.country_code,
-        Phone: shipping.phone || undefined, Email: order.email || undefined, Residence: true
+        City: shipping.city, State: shipping.province_code, Zip: shipping.zip,
+        Country: shipping.country_code, Phone: shipping.phone || undefined,
+        Email: order.email || undefined, Residence: true
       },
       Lines: order.line_items.map(item => ({
         SKU: item.sku, QTY: item.quantity,
@@ -398,14 +347,11 @@ async function syncTracking() {
   for (const order of orders) {
     const orderNum = `BLOOM-${order.order_number}`;
     const trackRes = await request({
-      hostname: "api.cosmopolitanusa.com",
-      path: `/v1/dropship/suborder/${encodeURIComponent(orderNum)}`,
-      method: "GET",
-      headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
+      hostname: "api.cosmopolitanusa.com", path: `/v1/dropship/suborder/${encodeURIComponent(orderNum)}`,
+      method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
     });
-    const shipments = trackRes.body?.Shipments || [];
-    const tracking = shipments[0]?.TrackingNumber;
-    const carrier = shipments[0]?.Carrier || "other";
+    const tracking = trackRes.body?.Shipments?.[0]?.TrackingNumber;
+    const carrier = trackRes.body?.Shipments?.[0]?.Carrier || "other";
     if (!tracking) continue;
     const foRes = await request({
       hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}/fulfillment_orders.json`,
@@ -436,7 +382,7 @@ async function syncTracking() {
   }
 }
 
-// ─── MAIN SYNC ───────────────────────────────────────────────────────────────
+// ─── MAIN SYNC ────────────────────────────────────────────────────────────────
 async function runSync(fullReset = false) {
   if (!SHOPIFY_TOKEN) { console.log("⚠️ No token — visit /install"); return; }
   if (syncRunning) { console.log("⚠️ Sync already running"); return; }
@@ -446,106 +392,123 @@ async function runSync(fullReset = false) {
   try {
     if (fullReset) clearProgress();
     const progress = loadProgress();
-    const processedGroups = new Set(progress.processedGroups || []);
+    const processedGroups = progress.processedGroups || {}; // groupKey -> shopifyProductId
+    let startPage = progress.lastPageProcessed || 1;
 
-    // Step 1: Fetch all items from Cosmopolitan
-    const allItems = await fetchAllCosmoItems();
-    if (allItems.length === 0) { console.log("❌ No items from Cosmopolitan"); syncRunning = false; return; }
-
-    // Step 2: Get existing Shopify SKUs
-    const { skuMap } = await getAllShopifyProducts();
+    const skuMap = await getAllShopifySkus();
     const locationId = await getLocationId();
 
-    // Step 3: Fetch details and group by fragrance
-    console.log("📋 Fetching product details and grouping by fragrance...");
-    const groups = {}; // groupKey -> array of details
-    const productLines = new Set(); // track all product lines
+    // Build a temporary in-memory group store for this run
+    // We process page by page to keep memory low
+    let page = startPage;
+    let totalCreated = 0, totalUpdated = 0;
+    const allowedLines = ["FRAG", "GIFT", "GSET", "SET", "COFF", "GFTS"];
 
-    for (let i = 0; i < allItems.length; i++) {
-      const item = allItems[i];
-      const detail = await fetchCosmoDetail(item.Item);
-      if (!detail) continue;
-      
-      // Log all product lines we see
-      if (detail.ProductLine) productLines.add(detail.ProductLine);
-      if (i === allItems.length - 1 || i % 500 === 0) {
-        console.log("📋 Product lines found so far:", Array.from(productLines).join(", "));
+    // First pass: collect ALL items across all pages (just SKU + basic info, no detail calls)
+    console.log("📋 Collecting all items from Cosmopolitan...");
+    let allItems = [];
+    let p = 1;
+    while (true) {
+      const { items, hasMore } = await fetchCosmoPage(p);
+      if (items.length === 0) break;
+      allItems = allItems.concat(items);
+      console.log(`📦 Page ${p}: ${items.length} items, total: ${allItems.length}`);
+      if (!hasMore) break;
+      p++;
+      await sleep(150);
+    }
+    console.log(`✅ Total: ${allItems.length} items from Cosmopolitan`);
+
+    // Second pass: fetch details in batches of 50, group, and create products
+    const BATCH = 50;
+    const groups = {}; // groupKey -> [details]
+    const seenProductLines = new Set();
+
+    for (let i = 0; i < allItems.length; i += BATCH) {
+      const batch = allItems.slice(i, i + BATCH);
+      console.log(`🔍 Fetching details for items ${i+1}-${Math.min(i+BATCH, allItems.length)}/${allItems.length}...`);
+
+      for (const item of batch) {
+        // Skip already processed SKUs (inventory update only)
+        if (skuMap[item.Item]) {
+          await updateInventory(skuMap[item.Item].variantId, item.Available || 0, locationId);
+          totalUpdated++;
+          await sleep(200);
+          continue;
+        }
+
+        const detail = await fetchCosmoDetail(item.Item);
+        if (!detail) continue;
+        if (detail.ProductLine) seenProductLines.add(detail.ProductLine);
+        if (!allowedLines.includes(detail.ProductLine)) continue;
+
+        const key = buildGroupKey(detail);
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(detail);
+        await sleep(250);
       }
-      
-      // Pull FRAG and gift/set related product lines
-      const allowedLines = ["FRAG", "GIFT", "GSET", "SET", "COFF", "GFTS"];
-      if (!allowedLines.includes(detail.ProductLine)) continue;
 
-      const key = buildGroupKey(detail);
-      if (!groups[key]) groups[key] = [];
-      groups[key].push(detail);
+      // After each batch, create any complete groups
+      // A group is "complete enough" if we've seen all its items
+      // We'll create groups that have at least 1 item
+      for (const [key, groupDetails] of Object.entries(groups)) {
+        if (processedGroups[key]) {
+          // Already created — just update inventory
+          continue;
+        }
 
-      if (i % 100 === 0) console.log(`📋 Processed ${i+1}/${allItems.length} items into groups...`);
-      await sleep(300);
+        // Check if any SKU in this group now exists in Shopify (from previous sync)
+        const existingInShopify = groupDetails.find(d => skuMap[d.Item]);
+        if (existingInShopify) {
+          const productId = skuMap[existingInShopify.Item].productId;
+          for (const detail of groupDetails) {
+            if (!skuMap[detail.Item]) {
+              await addVariantToProduct(productId, detail);
+              await sleep(300);
+            }
+          }
+          processedGroups[key] = productId;
+          totalUpdated++;
+        } else {
+          const created = await createShopifyProduct(groupDetails);
+          if (created) {
+            processedGroups[key] = created.id;
+            // Update skuMap for new variants
+            for (const v of created.variants || []) {
+              if (v.sku) skuMap[v.sku] = { productId: created.id, variantId: v.id };
+            }
+            totalCreated++;
+          }
+          await sleep(400);
+        }
+
+        delete groups[key]; // free memory
+      }
+
+      // Save progress after each batch
+      saveProgress({ processedGroups, lastPageProcessed: page });
+      console.log(`💾 Progress: ${totalCreated} created, ${totalUpdated} updated`);
     }
 
-    console.log(`📦 Grouped into ${Object.keys(groups).length} unique fragrances`);
-
-    // Step 4: Create/update products
-    let created = 0, updated = 0, skipped = 0;
-    const groupKeys = Object.keys(groups);
-
-    for (let g = 0; g < groupKeys.length; g++) {
-      const key = groupKeys[g];
-      const groupDetails = groups[key];
-
-      // Check if any SKU in group already exists
-      const existingVariant = groupDetails.find(d => skuMap[d.Item]);
-
-      if (processedGroups.has(key)) {
-        // Update inventory for all variants in group
-        for (const detail of groupDetails) {
-          if (skuMap[detail.Item]) {
-            await updateInventory(skuMap[detail.Item].variantId, detail.Available || 0, locationId);
-            updated++;
-          }
-        }
-        continue;
+    // Final pass: create any remaining groups
+    for (const [key, groupDetails] of Object.entries(groups)) {
+      if (processedGroups[key]) continue;
+      const created = await createShopifyProduct(groupDetails);
+      if (created) {
+        totalCreated++;
+        processedGroups[key] = created.id;
       }
-
-      if (existingVariant) {
-        // Product exists — add any missing variants and update inventory
-        const productId = skuMap[existingVariant.Item].productId;
-        for (const detail of groupDetails) {
-          if (skuMap[detail.Item]) {
-            await updateInventory(skuMap[detail.Item].variantId, detail.Available || 0, locationId);
-            updated++;
-          } else {
-            // Add new size variant to existing product
-            await addVariantToProduct(productId, detail);
-            updated++;
-          }
-          await sleep(300);
-        }
-      } else {
-        // New product — create with all size variants
-        await createShopifyProductWithVariants(groupDetails);
-        created++;
-        await sleep(500);
-      }
-
-      processedGroups.add(key);
-
-      // Save progress every 25 groups
-      if (g % 25 === 0) {
-        saveProgress({ processedGroups: Array.from(processedGroups) });
-        console.log(`💾 Progress saved: ${g+1}/${groupKeys.length} groups processed`);
-      }
+      await sleep(400);
     }
 
+    console.log(`\n📋 Product lines seen: ${Array.from(seenProductLines).join(", ")}`);
     clearProgress();
-    console.log(`\n📊 Sync complete! Created: ${created} products, Updated: ${updated} variants, Skipped: ${skipped}`);
+    console.log(`\n📊 Sync complete! Created: ${totalCreated}, Updated: ${totalUpdated}`);
 
-    // Process orders and tracking
     await processOrders();
     await syncTracking();
-
     console.log("🌸 All done!");
+
   } catch (err) {
     console.error("❌ Sync error:", err.message);
     console.error(err.stack);
@@ -560,11 +523,13 @@ const server = http.createServer(async (req, res) => {
 
   if (path === "/") {
     res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(`<h1>🌸 Bloom Fragrances USA Sync</h1>
-      <p>Status: ${SHOPIFY_TOKEN ? "✅ Connected to Shopify" : "⚠️ Not connected"}</p>
+    res.end(`<h1>🌸 Bloom Fragrances USA</h1>
+      <p>Status: ${SHOPIFY_TOKEN ? "✅ Connected" : "⚠️ Not connected"}</p>
       <p>Sync running: ${syncRunning ? "Yes ⏳" : "No"}</p>
-      ${!SHOPIFY_TOKEN ? '<a href="/install"><button>Connect to Shopify</button></a>' :
-        '<a href="/sync"><button>Run Sync Now</button></a> <a href="/fullsync"><button>Full Reset Sync</button></a>'}`);
+      ${!SHOPIFY_TOKEN
+        ? '<a href="/install"><button>Connect to Shopify</button></a>'
+        : '<a href="/sync"><button>Sync Now</button></a> &nbsp; <a href="/fullsync"><button>Full Reset Sync</button></a>'
+      }`);
   }
   else if (path === "/install") {
     const host = `https://${req.headers.host}`;
@@ -575,12 +540,11 @@ const server = http.createServer(async (req, res) => {
     const code = parsed.query.code;
     if (!code) { res.writeHead(400); res.end("Missing code"); return; }
     try {
-      const host = `https://${req.headers.host}`;
-      SHOPIFY_TOKEN = await exchangeCodeForToken(code, host);
-      console.log("✅ Shopify OAuth complete!");
+      SHOPIFY_TOKEN = await exchangeCodeForToken(code, `https://${req.headers.host}`);
+      console.log("✅ OAuth complete!");
       console.log("🔑 SAVE THIS TOKEN TO RENDER ENV: " + SHOPIFY_TOKEN);
       res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(`<h1>✅ Connected!</h1><p>Sync starting now...</p><p><a href="/">Go back</a></p>`);
+      res.end(`<h1>✅ Connected!</h1><p>Sync starting...</p><a href="/">Back</a>`);
       runSync(true);
     } catch (err) {
       res.writeHead(500);
@@ -597,14 +561,11 @@ const server = http.createServer(async (req, res) => {
     res.end("Full reset sync started! Check logs.");
     runSync(true);
   }
-  else {
-    res.writeHead(404);
-    res.end("Not found");
-  }
+  else { res.writeHead(404); res.end("Not found"); }
 });
 
 server.listen(PORT, () => {
-  console.log(`🌸 Bloom Fragrances USA server running on port ${PORT}`);
+  console.log(`🌸 Server running on port ${PORT}`);
   setInterval(() => runSync(), 30 * 60 * 1000);
   if (SHOPIFY_TOKEN) setTimeout(() => runSync(), 5000);
 });
