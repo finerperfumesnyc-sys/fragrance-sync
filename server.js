@@ -237,7 +237,21 @@ async function createShopifyProduct(groupDetails) {
   const description = buildDescription(groupDetails);
   const imageUrl = groupDetails.find(d => d.ImageURL)?.ImageURL?.trim().replace("http://", "https://");
 
-  const sortedDetails = [...groupDetails].sort((a, b) => {
+  const sorted = [...groupDetails].sort((a, b) => {
+    const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
+    const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
+    return sizeA - sizeB;
+  });
+
+  // Dedupe by size — if two Cosmopolitan items share the same size, keep the one with more stock
+  const bySize = {};
+  for (const detail of sorted) {
+    const size = extractSize(detail.Desc || "") || "One Size";
+    if (!bySize[size] || (detail.Available || 0) > (bySize[size].Available || 0)) {
+      bySize[size] = detail;
+    }
+  }
+  const sortedDetails = Object.values(bySize).sort((a, b) => {
     const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     return sizeA - sizeB;
