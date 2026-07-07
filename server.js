@@ -1,6 +1,10 @@
 /**
- * Bloom Fragrances USA - Shopify OAuth + Sync Server
- * Optimized: fetches details in batches, groups, creates products progressively
+ * Bloom Fragrances USA - Shopify OAuth + Sync Server (FINAL, with fixes)
+ * - Groups sizes into variants
+ * - Smart pricing (wholesale+20 OR retail-5, whichever lower)
+ * - Clean auto titles/descriptions
+ * - Checkpoint fix: saves real Phase 1 progress, resumes on restart
+ * - Retry fix: fetchCosmoDetail throws on failure so retries actually work
  */
 
 const https = require("https");
@@ -37,7 +41,6 @@ function request(options, body = null) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Retry wrapper - retries failed API calls up to 3 times
 async function withRetry(fn, retries = 3, delayMs = 1000) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -55,7 +58,7 @@ function loadProgress() {
   try {
     if (fs.existsSync(PROGRESS_FILE)) return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8"));
   } catch(e) {}
-  return { processedGroups: {}, lastPageProcessed: 0 };
+  return { processedGroups: {}, groups: {}, lastItemIndex: 0, allItems: null };
 }
 
 function saveProgress(progress) {
@@ -89,10 +92,9 @@ function extractSize(title) {
   const match = title.match(/(\d+\.?\d*)\s*OZ/i);
   if (!match) return null;
   const size = `${match[1]} oz`;
-  // Label testers clearly — exclude slightly damaged
   const isTester = /TESTER|NO CAP|UNBOXED/i.test(title);
   const isDamaged = /SLIGHTLY DAMAGED/i.test(title);
-  if (isDamaged) return null; // skip damaged products entirely
+  if (isDamaged) return null;
   return isTester ? `${size} (Tester)` : size;
 }
 
@@ -108,7 +110,6 @@ function extractProductType(title) {
 
 function extractFragranceName(title) {
   if (!title) return "";
-  // Cosmopolitan format: "FRAGRANCE NAME/DESIGNER REST" - take BEFORE the slash
   const name = title.includes("/") ? title.split("/")[0].trim() : title.trim();
   return name.split(" ").map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : "").join(" ").trim();
 }
@@ -117,7 +118,6 @@ function buildGroupKey(detail) {
   const designer = (detail.Designer || "UNKNOWN").toUpperCase().trim();
   const gender = extractGender(detail.Desc || "");
   const productType = extractProductType(detail.Desc || "");
-  // Get fragrance name (before /) and strip size for grouping
   const desc = (detail.Desc || detail.Item).toUpperCase();
   const fragPart = desc.includes("/") ? desc.split("/")[0].trim() : desc;
   return `${designer}||${fragPart}||${productType}||${gender}`;
@@ -130,7 +130,6 @@ function buildProductTitle(details) {
   const productType = extractProductType(first.Desc || "");
   const gender = extractGender(first.Desc || "");
   const genderLabel = gender === "M" ? "for Men" : gender === "W" ? "for Women" : "";
-  // Avoid duplicate designer name
   let cleanFragName = fragName;
   if (cleanFragName.toUpperCase().startsWith(designer.toUpperCase())) {
     cleanFragName = cleanFragName.slice(designer.length).trim();
@@ -149,7 +148,7 @@ function buildDescription(details) {
   const gender = extractGender(first.Desc || "");
   const genderWord = gender === "M" ? "men's" : gender === "W" ? "women's" : "unisex";
   const sizes = [...new Set(details.map(d => extractSize(d.Desc || "")).filter(Boolean))].sort((a,b) => parseFloat(a) - parseFloat(b)).filter(s => !s.includes("Tester")).join(", ");
-  const typeExplain = productType === "Eau de Parfum" ? " Eau de Parfum offers a rich, long-lasting scent that lingers throughout the day." 
+  const typeExplain = productType === "Eau de Parfum" ? " Eau de Parfum offers a rich, long-lasting scent that lingers throughout the day."
     : productType === "Eau de Toilette" ? " Eau de Toilette is a lighter, fresh concentration perfect for everyday wear."
     : productType === "Cologne" ? " A light, refreshing concentration ideal for daily use."
     : productType === "Parfum" ? " Parfum is the most concentrated and longest-lasting fragrance formulation."
@@ -191,12 +190,16 @@ async function fetchCosmoPage(page) {
   return { items: res.body.Results, hasMore: !!res.body.NextUrl };
 }
 
+// FIX: now throws on failure instead of returning null, so withRetry actually retries
 async function fetchCosmoDetail(itemCode) {
   const res = await request({
     hostname: "api.cosmopolitanusa.com", path: `/v1/products/${encodeURIComponent(itemCode)}`,
     method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
   });
-  return res.status === 200 ? res.body : null;
+  if (res.status !== 200 || !res.body) {
+    throw new Error(`Cosmo detail fetch failed for ${itemCode}, status ${res.status}`);
+  }
+  return res.body;
 }
 
 // ─── SHOPIFY API ─────────────────────────────────────────────────────────────
@@ -234,7 +237,6 @@ async function createShopifyProduct(groupDetails) {
   const description = buildDescription(groupDetails);
   const imageUrl = groupDetails.find(d => d.ImageURL)?.ImageURL?.trim().replace("http://", "https://");
 
-  // Sort by size smallest to largest
   const sortedDetails = [...groupDetails].sort((a, b) => {
     const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
@@ -426,43 +428,46 @@ async function runSync(fullReset = false) {
 
   try {
     if (fullReset) clearProgress();
-    const progress = loadProgress();
-    const processedGroups = progress.processedGroups || {}; // groupKey -> shopifyProductId
-    let startPage = progress.lastPageProcessed || 1;
+    const savedProgress = loadProgress();
+    const processedGroups = savedProgress.processedGroups || {};
 
     const skuMap = await getAllShopifySkus();
     const locationId = await getLocationId();
 
-    // Build a temporary in-memory group store for this run
-    // We process page by page to keep memory low
-    let page = startPage;
     let totalCreated = 0, totalUpdated = 0;
     const allowedLines = ["FRAG", "GIFT", "GSET", "SET", "COFF", "GFTS"];
 
-    // First pass: collect ALL items across all pages (just SKU + basic info, no detail calls)
-    console.log("📋 Collecting all items from Cosmopolitan...");
-    let allItems = [];
-    let p = 1;
-    while (true) {
-      const { items, hasMore } = await fetchCosmoPage(p);
-      if (items.length === 0) break;
-      allItems = allItems.concat(items);
-      console.log(`📦 Page ${p}: ${items.length} items, total: ${allItems.length}`);
-      if (!hasMore) break;
-      p++;
-      await sleep(150);
+    let allItems;
+    if (savedProgress.allItems && savedProgress.allItems.length > 0) {
+      console.log(`📋 Resuming with ${savedProgress.allItems.length} previously collected items`);
+      allItems = savedProgress.allItems;
+    } else {
+      console.log("📋 Collecting all items from Cosmopolitan...");
+      allItems = [];
+      let p = 1;
+      while (true) {
+        const { items, hasMore } = await fetchCosmoPage(p);
+        if (items.length === 0) break;
+        allItems = allItems.concat(items);
+        console.log(`📦 Page ${p}: ${items.length} items, total: ${allItems.length}`);
+        if (!hasMore) break;
+        p++;
+        await sleep(150);
+      }
+      console.log(`✅ Total: ${allItems.length} items from Cosmopolitan`);
+      saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems });
     }
-    console.log(`✅ Total: ${allItems.length} items from Cosmopolitan`);
 
-    // Second pass: fetch ALL details first, group completely, THEN create products
-    const groups = {}; // groupKey -> [details]
+    const groups = savedProgress.groups && Object.keys(savedProgress.groups).length
+      ? savedProgress.groups
+      : {};
+    const startIndex = savedProgress.lastItemIndex || 0;
     const seenProductLines = new Set();
 
-    console.log("🔍 Phase 1: Fetching all product details and grouping...");
-    for (let i = 0; i < allItems.length; i++) {
+    console.log(`🔍 Phase 1: Fetching all product details and grouping (resuming from item ${startIndex})...`);
+    for (let i = startIndex; i < allItems.length; i++) {
       const item = allItems[i];
 
-      // Skip already processed SKUs (inventory update only)
       if (skuMap[item.Item]) {
         await updateInventory(skuMap[item.Item].variantId, item.Available || 0, locationId);
         totalUpdated++;
@@ -479,17 +484,17 @@ async function runSync(fullReset = false) {
       if (!groups[key]) groups[key] = [];
       groups[key].push(detail);
 
-      if (i % 100 === 0) {
+      if (i % 25 === 0) {
         console.log(`📋 ${i+1}/${allItems.length} items processed, ${Object.keys(groups).length} groups so far`);
-        saveProgress({ processedGroups, lastPageProcessed: 1 });
+        saveProgress({ processedGroups, groups, lastItemIndex: i + 1, allItems });
       }
       await sleep(250);
     }
 
     console.log(`📦 Phase 1 complete! ${Object.keys(groups).length} unique fragrances found`);
     console.log(`📋 Product lines: ${Array.from(seenProductLines).join(", ")}`);
+    saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems: null });
 
-    // Phase 2: Create all grouped products
     console.log("🛍️ Phase 2: Creating grouped products in Shopify...");
     const groupKeys = Object.keys(groups);
     for (let g = 0; g < groupKeys.length; g++) {
@@ -522,7 +527,7 @@ async function runSync(fullReset = false) {
       }
 
       if (g % 25 === 0) {
-        saveProgress({ processedGroups, lastPageProcessed: 1 });
+        saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems: null });
         console.log(`💾 Progress: ${g+1}/${groupKeys.length} groups, ${totalCreated} created`);
       }
     }
