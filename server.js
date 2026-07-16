@@ -1,10 +1,6 @@
 /**
- * Bloom Fragrances USA - Shopify OAuth + Sync Server (FINAL, with fixes)
- * - Groups sizes into variants
- * - Smart pricing (wholesale+20 OR retail-5, whichever lower)
- * - Clean auto titles/descriptions
- * - Checkpoint fix: saves real Phase 1 progress, resumes on restart
- * - Retry fix: fetchCosmoDetail throws on failure so retries actually work
+ * Bloom Fragrances USA - Shopify OAuth + Sync Server
+ * Optimized: fetches details in batches, groups, creates products progressively
  */
 
 const https = require("https");
@@ -23,8 +19,8 @@ let SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
 let syncRunning = false;
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
-function request(options, body = null) {
-  return new Promise((resolve, reject) => {
+async function request(options, body = null, retryOn429 = true) {
+  const result = await new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
@@ -37,10 +33,19 @@ function request(options, body = null) {
     if (body) req.write(typeof body === "string" ? body : JSON.stringify(body));
     req.end();
   });
+  // Handle Shopify rate limit - wait and retry
+  if (result.status === 429 && retryOn429) {
+    const retryAfter = parseInt(result.headers["retry-after"] || "2") * 1000;
+    console.log(`⏳ Rate limited. Waiting ${retryAfter}ms...`);
+    await new Promise(r => setTimeout(r, retryAfter));
+    return request(options, body, false);
+  }
+  return result;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Retry wrapper - retries failed API calls up to 3 times
 async function withRetry(fn, retries = 3, delayMs = 1000) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -58,7 +63,7 @@ function loadProgress() {
   try {
     if (fs.existsSync(PROGRESS_FILE)) return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8"));
   } catch(e) {}
-  return { processedGroups: {}, groups: {}, lastItemIndex: 0, allItems: null };
+  return { processedGroups: {}, lastPageProcessed: 0 };
 }
 
 function saveProgress(progress) {
@@ -92,24 +97,26 @@ function extractSize(title) {
   const match = title.match(/(\d+\.?\d*)\s*OZ/i);
   if (!match) return null;
   const size = `${match[1]} oz`;
+  // Label testers clearly — exclude slightly damaged
   const isTester = /TESTER|NO CAP|UNBOXED/i.test(title);
   const isDamaged = /SLIGHTLY DAMAGED/i.test(title);
-  if (isDamaged) return null;
+  if (isDamaged) return null; // skip damaged products entirely
   return isTester ? `${size} (Tester)` : size;
 }
 
 function extractProductType(title) {
   if (!title) return "Fragrance";
-  if (/EDP|EAU DE PARFUM/i.test(title)) return "Eau de Parfum";
-  if (/EDT|EAU DE TOILETTE/i.test(title)) return "Eau de Toilette";
-  if (/EDC|EAU DE COLOGNE/i.test(title)) return "Cologne";
-  if (/PARFUM/i.test(title)) return "Parfum";
-  if (/COLOGNE/i.test(title)) return "Cologne";
+  if (/\bEAU DE PARFUM\b|\bEDP\b/i.test(title)) return "Eau de Parfum";
+  if (/\bEAU DE TOILETTE\b|\bEDT\b/i.test(title)) return "Eau de Toilette";
+  if (/\bEAU DE COLOGNE\b|\bEDC\b/i.test(title)) return "Cologne";
+  if (/\bCOLOGNE\b/i.test(title)) return "Cologne";
+  if (/\bPARFUM\b/i.test(title)) return "Parfum";
   return "Fragrance";
 }
 
 function extractFragranceName(title) {
   if (!title) return "";
+  // Cosmopolitan format: "FRAGRANCE NAME/DESIGNER REST" - take BEFORE the slash
   const name = title.includes("/") ? title.split("/")[0].trim() : title.trim();
   return name.split(" ").map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : "").join(" ").trim();
 }
@@ -118,6 +125,7 @@ function buildGroupKey(detail) {
   const designer = (detail.Designer || "UNKNOWN").toUpperCase().trim();
   const gender = extractGender(detail.Desc || "");
   const productType = extractProductType(detail.Desc || "");
+  // Get fragrance name (before /) and strip size for grouping
   const desc = (detail.Desc || detail.Item).toUpperCase();
   const fragPart = desc.includes("/") ? desc.split("/")[0].trim() : desc;
   return `${designer}||${fragPart}||${productType}||${gender}`;
@@ -130,6 +138,7 @@ function buildProductTitle(details) {
   const productType = extractProductType(first.Desc || "");
   const gender = extractGender(first.Desc || "");
   const genderLabel = gender === "M" ? "for Men" : gender === "W" ? "for Women" : "";
+  // Avoid duplicate designer name
   let cleanFragName = fragName;
   if (cleanFragName.toUpperCase().startsWith(designer.toUpperCase())) {
     cleanFragName = cleanFragName.slice(designer.length).trim();
@@ -148,7 +157,7 @@ function buildDescription(details) {
   const gender = extractGender(first.Desc || "");
   const genderWord = gender === "M" ? "men's" : gender === "W" ? "women's" : "unisex";
   const sizes = [...new Set(details.map(d => extractSize(d.Desc || "")).filter(Boolean))].sort((a,b) => parseFloat(a) - parseFloat(b)).filter(s => !s.includes("Tester")).join(", ");
-  const typeExplain = productType === "Eau de Parfum" ? " Eau de Parfum offers a rich, long-lasting scent that lingers throughout the day."
+  const typeExplain = productType === "Eau de Parfum" ? " Eau de Parfum offers a rich, long-lasting scent that lingers throughout the day." 
     : productType === "Eau de Toilette" ? " Eau de Toilette is a lighter, fresh concentration perfect for everyday wear."
     : productType === "Cologne" ? " A light, refreshing concentration ideal for daily use."
     : productType === "Parfum" ? " Parfum is the most concentrated and longest-lasting fragrance formulation."
@@ -190,16 +199,12 @@ async function fetchCosmoPage(page) {
   return { items: res.body.Results, hasMore: !!res.body.NextUrl };
 }
 
-// FIX: now throws on failure instead of returning null, so withRetry actually retries
 async function fetchCosmoDetail(itemCode) {
   const res = await request({
     hostname: "api.cosmopolitanusa.com", path: `/v1/products/${encodeURIComponent(itemCode)}`,
     method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
   });
-  if (res.status !== 200 || !res.body) {
-    throw new Error(`Cosmo detail fetch failed for ${itemCode}, status ${res.status}`);
-  }
-  return res.body;
+  return res.status === 200 ? res.body : null;
 }
 
 // ─── SHOPIFY API ─────────────────────────────────────────────────────────────
@@ -237,21 +242,8 @@ async function createShopifyProduct(groupDetails) {
   const description = buildDescription(groupDetails);
   const imageUrl = groupDetails.find(d => d.ImageURL)?.ImageURL?.trim().replace("http://", "https://");
 
-  const sorted = [...groupDetails].sort((a, b) => {
-    const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
-    const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
-    return sizeA - sizeB;
-  });
-
-  // Dedupe by size — if two Cosmopolitan items share the same size, keep the one with more stock
-  const bySize = {};
-  for (const detail of sorted) {
-    const size = extractSize(detail.Desc || "") || "One Size";
-    if (!bySize[size] || (detail.Available || 0) > (bySize[size].Available || 0)) {
-      bySize[size] = detail;
-    }
-  }
-  const sortedDetails = Object.values(bySize).sort((a, b) => {
+  // Sort by size smallest to largest
+  const sortedDetails = [...groupDetails].sort((a, b) => {
     const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     return sizeA - sizeB;
@@ -295,6 +287,20 @@ async function createShopifyProduct(groupDetails) {
   }
   console.log(`⚠️ Failed: ${title} — ${JSON.stringify(res.body).slice(0, 150)}`);
   return null;
+}
+
+async function updateShopifyProduct(productId, groupDetails) {
+  const title = buildProductTitle(groupDetails);
+  const description = buildDescription(groupDetails);
+  const res = await request(
+    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}.json`, method: "PUT",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+    { product: { id: productId, title, body_html: description,
+        vendor: groupDetails[0].Designer || "Cosmopolitan Cosmetics",
+        product_type: extractProductType(groupDetails[0].Desc || "") } }
+  );
+  if (res.status === 200) console.log(`🔄 Updated: ${title}`);
+  return res.status === 200;
 }
 
 async function addVariantToProduct(productId, detail) {
@@ -354,7 +360,7 @@ async function processOrders() {
       },
       Lines: order.line_items.map(item => ({
         SKU: item.sku, QTY: item.quantity,
-        NET: Math.max(parseFloat(item.price) - 20, 1).toFixed(2),
+        NET: parseFloat(item.price || 0).toFixed(2),
         EndPrice: shipping.country_code !== "US" ? parseFloat(item.price).toFixed(2) : undefined
       }))
     };
@@ -442,46 +448,43 @@ async function runSync(fullReset = false) {
 
   try {
     if (fullReset) clearProgress();
-    const savedProgress = loadProgress();
-    const processedGroups = savedProgress.processedGroups || {};
+    const progress = loadProgress();
+    const processedGroups = progress.processedGroups || {}; // groupKey -> shopifyProductId
+    let startPage = progress.lastPageProcessed || 1;
 
     const skuMap = await getAllShopifySkus();
     const locationId = await getLocationId();
 
+    // Build a temporary in-memory group store for this run
+    // We process page by page to keep memory low
+    let page = startPage;
     let totalCreated = 0, totalUpdated = 0;
     const allowedLines = ["FRAG", "GIFT", "GSET", "SET", "COFF", "GFTS"];
 
-    let allItems;
-    if (savedProgress.allItems && savedProgress.allItems.length > 0) {
-      console.log(`📋 Resuming with ${savedProgress.allItems.length} previously collected items`);
-      allItems = savedProgress.allItems;
-    } else {
-      console.log("📋 Collecting all items from Cosmopolitan...");
-      allItems = [];
-      let p = 1;
-      while (true) {
-        const { items, hasMore } = await fetchCosmoPage(p);
-        if (items.length === 0) break;
-        allItems = allItems.concat(items);
-        console.log(`📦 Page ${p}: ${items.length} items, total: ${allItems.length}`);
-        if (!hasMore) break;
-        p++;
-        await sleep(150);
-      }
-      console.log(`✅ Total: ${allItems.length} items from Cosmopolitan`);
-      saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems });
+    // First pass: collect ALL items across all pages (just SKU + basic info, no detail calls)
+    console.log("📋 Collecting all items from Cosmopolitan...");
+    let allItems = [];
+    let p = 1;
+    while (true) {
+      const { items, hasMore } = await fetchCosmoPage(p);
+      if (items.length === 0) break;
+      allItems = allItems.concat(items);
+      console.log(`📦 Page ${p}: ${items.length} items, total: ${allItems.length}`);
+      if (!hasMore) break;
+      p++;
+      await sleep(150);
     }
+    console.log(`✅ Total: ${allItems.length} items from Cosmopolitan`);
 
-    const groups = savedProgress.groups && Object.keys(savedProgress.groups).length
-      ? savedProgress.groups
-      : {};
-    const startIndex = savedProgress.lastItemIndex || 0;
+    // Second pass: fetch ALL details first, group completely, THEN create products
+    const groups = {}; // groupKey -> [details]
     const seenProductLines = new Set();
 
-    console.log(`🔍 Phase 1: Fetching all product details and grouping (resuming from item ${startIndex})...`);
-    for (let i = startIndex; i < allItems.length; i++) {
+    console.log("🔍 Phase 1: Fetching all product details and grouping...");
+    for (let i = 0; i < allItems.length; i++) {
       const item = allItems[i];
 
+      // Skip already processed SKUs (inventory update only)
       if (skuMap[item.Item]) {
         await updateInventory(skuMap[item.Item].variantId, item.Available || 0, locationId);
         totalUpdated++;
@@ -498,17 +501,17 @@ async function runSync(fullReset = false) {
       if (!groups[key]) groups[key] = [];
       groups[key].push(detail);
 
-      if (i % 25 === 0) {
+      if (i % 100 === 0) {
         console.log(`📋 ${i+1}/${allItems.length} items processed, ${Object.keys(groups).length} groups so far`);
-        saveProgress({ processedGroups, groups, lastItemIndex: i + 1, allItems });
+        saveProgress({ processedGroups, lastPageProcessed: 1 });
       }
       await sleep(250);
     }
 
     console.log(`📦 Phase 1 complete! ${Object.keys(groups).length} unique fragrances found`);
     console.log(`📋 Product lines: ${Array.from(seenProductLines).join(", ")}`);
-    saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems: null });
 
+    // Phase 2: Create all grouped products
     console.log("🛍️ Phase 2: Creating grouped products in Shopify...");
     const groupKeys = Object.keys(groups);
     for (let g = 0; g < groupKeys.length; g++) {
@@ -520,10 +523,16 @@ async function runSync(fullReset = false) {
       const existingInShopify = groupDetails.find(d => skuMap[d.Item]);
       if (existingInShopify) {
         const productId = skuMap[existingInShopify.Item].productId;
+        // Update title and description on existing product
+        await updateShopifyProduct(productId, groupDetails);
+        // Add any missing size variants
         for (const detail of groupDetails) {
           if (!skuMap[detail.Item]) {
             await addVariantToProduct(productId, detail);
             await sleep(300);
+          } else {
+            // Update inventory on existing variant
+            await updateInventory(skuMap[detail.Item].variantId, detail.Available || 0, locationId);
           }
         }
         processedGroups[key] = productId;
@@ -541,7 +550,7 @@ async function runSync(fullReset = false) {
       }
 
       if (g % 25 === 0) {
-        saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems: null });
+        saveProgress({ processedGroups, lastPageProcessed: 1 });
         console.log(`💾 Progress: ${g+1}/${groupKeys.length} groups, ${totalCreated} created`);
       }
     }
