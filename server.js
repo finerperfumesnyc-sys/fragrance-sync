@@ -1,13 +1,15 @@
 /**
- * Bloom Fragrances USA - Shopify OAuth + Sync Server (MERGED FINAL)
- * Combines:
+ * Bloom Fragrances USA - Shopify OAuth + Sync Server (COMPLETE FINAL)
+ * Includes:
  * - Checkpoint/resume fix (saves real Phase 1 progress, resumes on restart)
  * - Retry fix (fetchCosmoDetail throws on failure so retries actually work)
  * - Variant dedup fix (prevents "variant already exists" failures)
- * - NEW: Shopify 429 rate-limit handling with automatic backoff
- * - NEW: updateShopifyProduct — keeps title/description fresh on existing products
- * - Handles Cosmopolitan items disappearing from feed (marks them out of stock
- *   instead of leaving stale inventory forever)
+ * - Shopify 429 rate-limit handling with automatic backoff
+ * - updateShopifyProduct — keeps title/description fresh on existing products
+ * - Discontinued-item detection (items fully removed from Cosmo's feed -> 0 stock)
+ * - inventory_policy: "deny" on EVERY variant, EVERY sync — this is the fix that
+ *   actually stops customers from buying items that are out of stock. Without this,
+ *   setting inventory to 0 was cosmetic only; Shopify still allowed checkout.
  */
 
 const https = require("https");
@@ -222,7 +224,7 @@ async function getAllShopifySkus() {
     });
     for (const p of res.body.products || [])
       for (const v of p.variants || [])
-        if (v.sku) skuMap[v.sku] = { productId: p.id, variantId: v.id };
+        if (v.sku) skuMap[v.sku] = { productId: p.id, variantId: v.id, inventoryItemId: v.inventory_item_id };
     const link = res.headers?.link || "";
     if (link.includes('rel="next"')) {
       const m = link.match(/<([^>]+)>;\s*rel="next"/);
@@ -252,6 +254,7 @@ async function createShopifyProduct(groupDetails) {
     return sizeA - sizeB;
   });
 
+  // Dedupe by size — if two Cosmopolitan items share the same size, keep the one with more stock
   const bySize = {};
   for (const detail of sorted) {
     const size = extractSize(detail.Desc || "") || "One Size";
@@ -273,6 +276,7 @@ async function createShopifyProduct(groupDetails) {
       price: calculatePrice(detail.Net, detail.Retail),
       compare_at_price: detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null,
       inventory_management: "shopify",
+      inventory_policy: "deny", // stops purchase once stock hits 0
       inventory_quantity: detail.Available || 0,
       weight: parseFloat(detail.Weight || 0),
       weight_unit: "oz",
@@ -328,7 +332,9 @@ async function addVariantToProduct(productId, detail) {
         option1: size, sku: detail.Item,
         price: calculatePrice(detail.Net, detail.Retail),
         compare_at_price: detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null,
-        inventory_management: "shopify", inventory_quantity: detail.Available || 0,
+        inventory_management: "shopify",
+        inventory_policy: "deny", // stops purchase once stock hits 0
+        inventory_quantity: detail.Available || 0,
         weight: parseFloat(detail.Weight || 0), weight_unit: "oz",
         fulfillment_service: "manual", requires_shipping: true, taxable: true
       }
@@ -337,13 +343,18 @@ async function addVariantToProduct(productId, detail) {
   return res.status === 201 ? res.body.variant : null;
 }
 
-async function updateInventory(variantId, available, locationId) {
-  const varRes = await request({
-    hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "GET",
-    headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
-  });
-  const inventoryItemId = varRes.body?.variant?.inventory_item_id;
+// Sets stock level AND forces inventory_policy to "deny" so 0 stock actually blocks
+// checkout. Takes inventoryItemId directly (fetched once upfront) instead of doing
+// a GET per call - this cuts API calls per item from 3 down to 2.
+async function updateInventory(variantId, inventoryItemId, available, locationId) {
   if (!inventoryItemId || !locationId) return;
+
+  await request(
+    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "PUT",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+    { variant: { id: variantId, inventory_policy: "deny" } }
+  );
+
   await request(
     { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/inventory_levels/set.json", method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
@@ -494,12 +505,12 @@ async function runSync(fullReset = false) {
       saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems });
     }
 
-    // Mark items no longer in Cosmopolitan's feed as out of stock
+    // Mark items no longer in Cosmopolitan's feed at all as out of stock
     const currentSkus = new Set(allItems.map(i => i.Item));
     let markedOutOfStock = 0;
     for (const sku of Object.keys(skuMap)) {
       if (!currentSkus.has(sku)) {
-        await updateInventory(skuMap[sku].variantId, 0, locationId);
+        await updateInventory(skuMap[sku].variantId, skuMap[sku].inventoryItemId, 0, locationId);
         markedOutOfStock++;
         await sleep(150);
       }
@@ -516,8 +527,9 @@ async function runSync(fullReset = false) {
     for (let i = startIndex; i < allItems.length; i++) {
       const item = allItems[i];
 
+      // This handles the common case: item still IN the feed but Available: 0
       if (skuMap[item.Item]) {
-        await updateInventory(skuMap[item.Item].variantId, item.Available || 0, locationId);
+        await updateInventory(skuMap[item.Item].variantId, skuMap[item.Item].inventoryItemId, item.Available || 0, locationId);
         totalUpdated++;
         await sleep(150);
         continue;
@@ -646,6 +658,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`🌸 Server running on port ${PORT}`);
-  setInterval(() => runSync(), 30 * 60 * 1000);
+  setInterval(() => runSync(), 45 * 60 * 1000);
   if (SHOPIFY_TOKEN) setTimeout(() => runSync(), 5000);
 });
