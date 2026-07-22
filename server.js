@@ -216,15 +216,18 @@ async function fetchCosmoDetail(itemCode) {
 // ─── SHOPIFY API ─────────────────────────────────────────────────────────────
 async function getAllShopifySkus() {
   let skuMap = {};
-  let path = "/admin/api/2024-01/products.json?limit=250&fields=id,variants";
+  let titleToProductId = {};
+  let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,variants";
   while (true) {
     const res = await request({
       hostname: SHOPIFY_STORE, path, method: "GET",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
     });
-    for (const p of res.body.products || [])
+    for (const p of res.body.products || []) {
+      if (p.title) titleToProductId[p.title] = p.id;
       for (const v of p.variants || [])
         if (v.sku) skuMap[v.sku] = { productId: p.id, variantId: v.id, inventoryItemId: v.inventory_item_id };
+    }
     const link = res.headers?.link || "";
     if (link.includes('rel="next"')) {
       const m = link.match(/<([^>]+)>;\s*rel="next"/);
@@ -232,7 +235,7 @@ async function getAllShopifySkus() {
     } else break;
   }
   console.log(`🛍️ Existing Shopify SKUs: ${Object.keys(skuMap).length}`);
-  return skuMap;
+  return { skuMap, titleToProductId };
 }
 
 async function getLocationId() {
@@ -346,13 +349,34 @@ async function addVariantToProduct(productId, detail) {
 // Sets stock level AND forces inventory_policy to "deny" so 0 stock actually blocks
 // checkout. Takes inventoryItemId directly (fetched once upfront) instead of doing
 // a GET per call - this cuts API calls per item from 3 down to 2.
-async function updateInventory(variantId, inventoryItemId, available, locationId) {
+async function deleteVariant(productId, variantId) {
+  const res = await request(
+    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}/variants/${variantId}.json`, method: "DELETE",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } }
+  );
+  return res.status === 200;
+}
+
+async function setProductStatus(productId, status) {
+  const res = await request(
+    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}.json`, method: "PUT",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+    { product: { id: productId, status } }
+  );
+  return res.status === 200;
+}
+
+async function updateInventory(variantId, inventoryItemId, available, locationId, price, compareAtPrice) {
   if (!inventoryItemId || !locationId) return;
+
+  const variantUpdate = { id: variantId, inventory_policy: "deny" };
+  if (price) variantUpdate.price = price;
+  if (compareAtPrice) variantUpdate.compare_at_price = compareAtPrice;
 
   await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "PUT",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { variant: { id: variantId, inventory_policy: "deny" } }
+    { variant: variantUpdate }
   );
 
   await request(
@@ -478,7 +502,7 @@ async function runSync(fullReset = false) {
     const savedProgress = loadProgress();
     const processedGroups = savedProgress.processedGroups || {};
 
-    const skuMap = await getAllShopifySkus();
+    const { skuMap, titleToProductId } = await getAllShopifySkus();
     const locationId = await getLocationId();
 
     let totalCreated = 0, totalUpdated = 0;
@@ -505,17 +529,62 @@ async function runSync(fullReset = false) {
       saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems });
     }
 
-    // Mark items no longer in Cosmopolitan's feed at all as out of stock
-    const currentSkus = new Set(allItems.map(i => i.Item));
-    let markedOutOfStock = 0;
+    // ── Remove/hide anything not currently available on Cosmopolitan ──
+    // If ALL sizes of a product are gone/out of stock -> unpublish the whole product
+    // If SOME sizes are gone -> delete just those size variants, keep the rest for sale
+    // If a product comes back in stock later, it's automatically republished
+    const cosmoData = {};
+    for (const item of allItems) cosmoData[item.Item] = item;
+
+    const variantsByProduct = {};
     for (const sku of Object.keys(skuMap)) {
-      if (!currentSkus.has(sku)) {
-        await updateInventory(skuMap[sku].variantId, skuMap[sku].inventoryItemId, 0, locationId);
-        markedOutOfStock++;
+      const v = skuMap[sku];
+      if (!variantsByProduct[v.productId]) variantsByProduct[v.productId] = [];
+      variantsByProduct[v.productId].push({ sku, variantId: v.variantId, inventoryItemId: v.inventoryItemId });
+    }
+
+    let unpublished = 0, variantsRemoved = 0, republished = 0, stockUpdated = 0;
+
+    for (const productId of Object.keys(variantsByProduct)) {
+      const variants = variantsByProduct[productId];
+      const outVariants = [];
+      const inVariants = [];
+      for (const v of variants) {
+        const item = cosmoData[v.sku];
+        const avail = item ? (item.Available || 0) : undefined;
+        if (avail === undefined || avail === 0) outVariants.push(v);
+        else inVariants.push({ ...v, available: avail, net: item.Net, retail: item.Retail });
+      }
+
+      if (outVariants.length === variants.length) {
+        await setProductStatus(productId, "draft");
+        unpublished++;
+        await sleep(200);
+      } else {
+        for (const v of outVariants) {
+          await deleteVariant(productId, v.variantId);
+          variantsRemoved++;
+          await sleep(200);
+        }
+        if (inVariants.length > 0) {
+          await setProductStatus(productId, "active");
+          republished++;
+          await sleep(200);
+        }
+      }
+
+      for (const v of inVariants) {
+        const freshPrice = calculatePrice(v.net, v.retail);
+        const freshCompareAt = v.retail ? parseFloat(v.retail).toFixed(2) : null;
+        await updateInventory(v.variantId, v.inventoryItemId, v.available, locationId, freshPrice, freshCompareAt);
+        stockUpdated++;
         await sleep(150);
       }
     }
-    if (markedOutOfStock > 0) console.log(`📉 Marked ${markedOutOfStock} discontinued SKUs as out of stock`);
+    console.log(`📉 Unpublished ${unpublished} fully out-of-stock products`);
+    console.log(`🗑️ Removed ${variantsRemoved} discontinued size variants`);
+    console.log(`🔄 Republished ${republished} restocked products`);
+    console.log(`📦 Updated stock on ${stockUpdated} variants`);
 
     const groups = savedProgress.groups && Object.keys(savedProgress.groups).length
       ? savedProgress.groups
@@ -527,11 +596,8 @@ async function runSync(fullReset = false) {
     for (let i = startIndex; i < allItems.length; i++) {
       const item = allItems[i];
 
-      // This handles the common case: item still IN the feed but Available: 0
+      // Existing SKUs already handled in the bulk pass above (stock/hide/delete/republish)
       if (skuMap[item.Item]) {
-        await updateInventory(skuMap[item.Item].variantId, skuMap[item.Item].inventoryItemId, item.Available || 0, locationId);
-        totalUpdated++;
-        await sleep(150);
         continue;
       }
 
@@ -563,24 +629,52 @@ async function runSync(fullReset = false) {
 
       if (processedGroups[key]) continue;
 
-      const existingInShopify = groupDetails.find(d => skuMap[d.Item]);
-      if (existingInShopify) {
-        const productId = skuMap[existingInShopify.Item].productId;
-        await updateShopifyProduct(productId, groupDetails);
-        for (const detail of groupDetails) {
-          if (!skuMap[detail.Item]) {
-            await addVariantToProduct(productId, detail);
-            await sleep(300);
+      // Check both: does this exact SKU already exist, OR does a product with the
+      // same computed title (same fragrance/designer/type/gender) already exist,
+      // even though this specific new SIZE hasn't been added yet.
+      const skuMatch = groupDetails.find(d => skuMap[d.Item]);
+      const computedTitle = buildProductTitle(groupDetails);
+      const titleMatchProductId = titleToProductId[computedTitle];
+      const existingProductId = skuMatch ? skuMap[skuMatch.Item].productId : titleMatchProductId;
+
+      if (existingProductId) {
+        await updateShopifyProduct(existingProductId, groupDetails);
+
+        // Dedupe new items by size before adding — if two Cosmo items share a size,
+        // keep the one with more stock, same protection as new-product creation
+        const newItems = groupDetails.filter(d => !skuMap[d.Item]);
+        const bySizeToAdd = {};
+        for (const detail of newItems) {
+          const size = extractSize(detail.Desc || "") || "One Size";
+          if (!bySizeToAdd[size] || (detail.Available || 0) > (bySizeToAdd[size].Available || 0)) {
+            bySizeToAdd[size] = detail;
           }
         }
-        processedGroups[key] = productId;
+
+        for (const detail of Object.values(bySizeToAdd)) {
+          const newVariant = await addVariantToProduct(existingProductId, detail);
+          if (newVariant && newVariant.sku) {
+            skuMap[newVariant.sku] = { productId: existingProductId, variantId: newVariant.id, inventoryItemId: newVariant.inventory_item_id };
+          }
+          await sleep(300);
+        }
+
+        // A new size means this fragrance is back in stock — make sure the product
+        // is published even if it was hidden earlier (in this run or a previous one)
+        if (Object.values(bySizeToAdd).length > 0) {
+          await setProductStatus(existingProductId, "active");
+          await sleep(200);
+        }
+
+        processedGroups[key] = existingProductId;
         totalUpdated++;
       } else {
         const created = await withRetry(() => createShopifyProduct(groupDetails));
         if (created) {
           processedGroups[key] = created.id;
+          titleToProductId[created.title] = created.id;
           for (const v of created.variants || []) {
-            if (v.sku) skuMap[v.sku] = { productId: created.id, variantId: v.id };
+            if (v.sku) skuMap[v.sku] = { productId: created.id, variantId: v.id, inventoryItemId: v.inventory_item_id };
           }
           totalCreated++;
         }
