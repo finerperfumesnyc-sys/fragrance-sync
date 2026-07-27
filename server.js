@@ -373,17 +373,23 @@ async function updateInventory(variantId, inventoryItemId, available, locationId
   if (price) variantUpdate.price = price;
   if (compareAtPrice) variantUpdate.compare_at_price = compareAtPrice;
 
-  await request(
+  const variantRes = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "PUT",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
     { variant: variantUpdate }
   );
+  if (variantRes.status !== 200) {
+    console.log(`⚠️ Variant update failed for ${variantId}: status ${variantRes.status} — ${JSON.stringify(variantRes.body).slice(0, 150)}`);
+  }
 
-  await request(
+  const invRes = await request(
     { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/inventory_levels/set.json", method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
     { location_id: locationId, inventory_item_id: inventoryItemId, available }
   );
+  if (invRes.status !== 200 && invRes.status !== 201) {
+    console.log(`⚠️ Inventory update failed for ${variantId}: status ${invRes.status}`);
+  }
 }
 
 // ─── ORDERS ──────────────────────────────────────────────────────────────────
@@ -574,11 +580,18 @@ async function runSync(fullReset = false) {
       }
 
       for (const v of inVariants) {
-        const freshPrice = calculatePrice(v.net, v.retail);
-        const freshCompareAt = v.retail ? parseFloat(v.retail).toFixed(2) : null;
+        const freshDetail = await withRetry(() => fetchCosmoDetail(v.sku));
+        let freshPrice, freshCompareAt;
+        if (freshDetail) {
+          freshPrice = calculatePrice(freshDetail.Net, freshDetail.Retail);
+          freshCompareAt = freshDetail.Retail ? parseFloat(freshDetail.Retail).toFixed(2) : null;
+        } else {
+          freshPrice = null; // couldn't get reliable data, leave existing price untouched
+          freshCompareAt = null;
+        }
         await updateInventory(v.variantId, v.inventoryItemId, v.available, locationId, freshPrice, freshCompareAt);
         stockUpdated++;
-        await sleep(150);
+        await sleep(250);
       }
     }
     console.log(`📉 Unpublished ${unpublished} fully out-of-stock products`);
