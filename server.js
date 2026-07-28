@@ -322,7 +322,11 @@ async function updateShopifyProduct(productId, groupDetails) {
         vendor: groupDetails[0].Designer || "Cosmopolitan Cosmetics",
         product_type: extractProductType(groupDetails[0].Desc || "") } }
   );
-  if (res.status === 200) console.log(`🔄 Updated: ${title}`);
+  if (res.status === 200) {
+    console.log(`🔄 Updated: ${title}`);
+  } else {
+    console.log(`⚠️ Product update failed for ${productId} (${title}): status ${res.status}`);
+  }
   return res.status === 200;
 }
 
@@ -343,7 +347,11 @@ async function addVariantToProduct(productId, detail) {
       }
     }
   );
-  return res.status === 201 ? res.body.variant : null;
+  if (res.status !== 201) {
+    console.log(`⚠️ Failed to add variant ${detail.Item} (${size}) to product ${productId}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 200)}`);
+    return null;
+  }
+  return res.body.variant;
 }
 
 // Sets stock level AND forces inventory_policy to "deny" so 0 stock actually blocks
@@ -354,6 +362,9 @@ async function deleteVariant(productId, variantId) {
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}/variants/${variantId}.json`, method: "DELETE",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } }
   );
+  if (res.status !== 200) {
+    console.log(`⚠️ Failed to delete variant ${variantId} from product ${productId}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
+  }
   return res.status === 200;
 }
 
@@ -363,6 +374,9 @@ async function setProductStatus(productId, status) {
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
     { product: { id: productId, status } }
   );
+  if (res.status !== 200) {
+    console.log(`⚠️ Failed to set product ${productId} to ${status}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
+  }
   return res.status === 200;
 }
 
@@ -586,7 +600,8 @@ async function runSync(fullReset = false) {
           freshPrice = calculatePrice(freshDetail.Net, freshDetail.Retail);
           freshCompareAt = freshDetail.Retail ? parseFloat(freshDetail.Retail).toFixed(2) : null;
         } else {
-          freshPrice = null; // couldn't get reliable data, leave existing price untouched
+          console.log(`⚠️ Could not fetch fresh price data for ${v.sku} — price left unchanged this cycle`);
+          freshPrice = null;
           freshCompareAt = null;
         }
         await updateInventory(v.variantId, v.inventoryItemId, v.available, locationId, freshPrice, freshCompareAt);
