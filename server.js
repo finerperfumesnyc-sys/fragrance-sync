@@ -217,6 +217,7 @@ async function fetchCosmoDetail(itemCode) {
 async function getAllShopifySkus() {
   let skuMap = {};
   let titleToProductId = {};
+  let productSizes = {}; // productId -> { size: {variantId, sku, inventoryItemId} }
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,variants";
   while (true) {
     const res = await request({
@@ -225,8 +226,11 @@ async function getAllShopifySkus() {
     });
     for (const p of res.body.products || []) {
       if (p.title) titleToProductId[p.title] = p.id;
-      for (const v of p.variants || [])
+      if (!productSizes[p.id]) productSizes[p.id] = {};
+      for (const v of p.variants || []) {
         if (v.sku) skuMap[v.sku] = { productId: p.id, variantId: v.id, inventoryItemId: v.inventory_item_id };
+        if (v.option1) productSizes[p.id][v.option1] = { variantId: v.id, sku: v.sku, inventoryItemId: v.inventory_item_id };
+      }
     }
     const link = res.headers?.link || "";
     if (link.includes('rel="next"')) {
@@ -235,7 +239,7 @@ async function getAllShopifySkus() {
     } else break;
   }
   console.log(`🛍️ Existing Shopify SKUs: ${Object.keys(skuMap).length}`);
-  return { skuMap, titleToProductId };
+  return { skuMap, titleToProductId, productSizes };
 }
 
 async function getLocationId() {
@@ -328,6 +332,31 @@ async function updateShopifyProduct(productId, groupDetails) {
     console.log(`⚠️ Product update failed for ${productId} (${title}): status ${res.status}`);
   }
   return res.status === 200;
+}
+
+// When Cosmopolitan issues a new item code for a size that already exists on the
+// product (e.g. a new inventory lot), update the existing variant with the fresher
+// data instead of trying to add a duplicate size (which Shopify would reject).
+async function refreshExistingVariant(variantId, inventoryItemId, detail, locationId) {
+  const price = calculatePrice(detail.Net, detail.Retail);
+  const compareAtPrice = detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null;
+  const res = await request(
+    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "PUT",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+    { variant: { id: variantId, sku: detail.Item, price, compare_at_price: compareAtPrice, inventory_policy: "deny" } }
+  );
+  if (res.status !== 200) {
+    console.log(`⚠️ Failed to refresh existing variant ${variantId} with new SKU ${detail.Item}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
+    return false;
+  }
+  if (inventoryItemId && locationId) {
+    await request(
+      { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/inventory_levels/set.json", method: "POST",
+        headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+      { location_id: locationId, inventory_item_id: inventoryItemId, available: detail.Available || 0 }
+    );
+  }
+  return true;
 }
 
 async function addVariantToProduct(productId, detail) {
@@ -522,7 +551,7 @@ async function runSync(fullReset = false) {
     const savedProgress = loadProgress();
     const processedGroups = savedProgress.processedGroups || {};
 
-    const { skuMap, titleToProductId } = await getAllShopifySkus();
+    const { skuMap, titleToProductId, productSizes } = await getAllShopifySkus();
     const locationId = await getLocationId();
 
     let totalCreated = 0, totalUpdated = 0;
@@ -680,9 +709,24 @@ async function runSync(fullReset = false) {
         }
 
         for (const detail of Object.values(bySizeToAdd)) {
-          const newVariant = await addVariantToProduct(existingProductId, detail);
-          if (newVariant && newVariant.sku) {
-            skuMap[newVariant.sku] = { productId: existingProductId, variantId: newVariant.id, inventoryItemId: newVariant.inventory_item_id };
+          const size = extractSize(detail.Desc || "") || "One Size";
+          const existingSizeEntry = productSizes[existingProductId] && productSizes[existingProductId][size];
+
+          if (existingSizeEntry) {
+            // This size already exists under a different SKU (Cosmo issued a new
+            // lot code) — refresh that variant with fresh price/stock instead of
+            // trying to add a duplicate, which Shopify would reject
+            const refreshed = await refreshExistingVariant(existingSizeEntry.variantId, existingSizeEntry.inventoryItemId, detail, locationId);
+            if (refreshed) {
+              skuMap[detail.Item] = { productId: existingProductId, variantId: existingSizeEntry.variantId, inventoryItemId: existingSizeEntry.inventoryItemId };
+            }
+          } else {
+            const newVariant = await addVariantToProduct(existingProductId, detail);
+            if (newVariant && newVariant.sku) {
+              skuMap[newVariant.sku] = { productId: existingProductId, variantId: newVariant.id, inventoryItemId: newVariant.inventory_item_id };
+              if (!productSizes[existingProductId]) productSizes[existingProductId] = {};
+              productSizes[existingProductId][size] = { variantId: newVariant.id, sku: newVariant.sku, inventoryItemId: newVariant.inventory_item_id };
+            }
           }
           await sleep(300);
         }
