@@ -392,7 +392,7 @@ async function updateShopifyProduct(productId, groupDetails, existingSizes) {
 // When Cosmopolitan issues a new item code for a size that already exists on the
 // product (e.g. a new inventory lot), update the existing variant with the fresher
 // data instead of trying to add a duplicate size (which Shopify would reject).
-async function refreshExistingVariant(variantId, inventoryItemId, detail, locationId) {
+async function refreshExistingVariant(variantId, inventoryItemId, detail, locationId, productId) {
   const price = calculatePrice(detail.Net, detail.Retail);
   const compareAtPrice = detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null;
   const res = await request(
@@ -400,6 +400,14 @@ async function refreshExistingVariant(variantId, inventoryItemId, detail, locati
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
     { variant: { id: variantId, sku: detail.Item, price, compare_at_price: compareAtPrice, inventory_policy: "deny" } }
   );
+  if (res.status === 404 && productId) {
+    // The target variant was already deleted earlier in this same sync (e.g. an
+    // old item code hit 0 stock and got removed before this new one could take
+    // its place) — fall back to creating it fresh instead of losing the size
+    console.log(`🔁 Variant ${variantId} no longer exists — creating a fresh variant for ${detail.Item} instead`);
+    const newVariant = await addVariantToProduct(productId, detail);
+    return newVariant ? { variantId: newVariant.id, inventoryItemId: newVariant.inventory_item_id, sku: newVariant.sku } : false;
+  }
   if (res.status !== 200) {
     console.log(`⚠️ Failed to refresh existing variant ${variantId} with new SKU ${detail.Item}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
     return false;
@@ -411,7 +419,7 @@ async function refreshExistingVariant(variantId, inventoryItemId, detail, locati
       { location_id: locationId, inventory_item_id: inventoryItemId, available: detail.Available || 0 }
     );
   }
-  return true;
+  return { variantId, inventoryItemId, sku: detail.Item };
 }
 
 async function addVariantToProduct(productId, detail) {
@@ -740,6 +748,18 @@ async function runSync(fullReset = false) {
       saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems });
     }
 
+    // ── SAFETY GUARD ──
+    // If Cosmopolitan returned suspiciously few items (a fraction of what your
+    // store actually has), something went wrong with the fetch — do NOT treat
+    // this as "everything is out of stock." Skip the hide/unpublish pass entirely
+    // rather than risk wrongly hiding the whole catalog.
+    const existingSkuCount = Object.keys(skuMap).length;
+    const minimumExpectedItems = Math.floor(existingSkuCount * 0.5);
+    let unpublished = 0, variantsRemoved = 0, republished = 0, stockUpdated = 0;
+    if (allItems.length < minimumExpectedItems) {
+      console.log(`🛑 SAFETY ABORT: Only got ${allItems.length} items from Cosmopolitan but store has ${existingSkuCount} SKUs. This looks like a failed fetch, not a real inventory change. Skipping the hide/unpublish pass this cycle to avoid wrongly hiding products.`);
+    } else {
+
     // ── Remove/hide anything not currently available on Cosmopolitan ──
     // If ALL sizes of a product are gone/out of stock -> unpublish the whole product
     // If SOME sizes are gone -> delete just those size variants, keep the rest for sale
@@ -753,8 +773,6 @@ async function runSync(fullReset = false) {
       if (!variantsByProduct[v.productId]) variantsByProduct[v.productId] = [];
       variantsByProduct[v.productId].push({ sku, variantId: v.variantId, inventoryItemId: v.inventoryItemId });
     }
-
-    let unpublished = 0, variantsRemoved = 0, republished = 0, stockUpdated = 0;
 
     for (const productId of Object.keys(variantsByProduct)) {
       // Never touch products that weren't created by this sync (no "fragrance"
@@ -808,6 +826,7 @@ async function runSync(fullReset = false) {
     console.log(`🗑️ Removed ${variantsRemoved} discontinued size variants`);
     console.log(`🔄 Republished ${republished} restocked products`);
     console.log(`📦 Updated stock on ${stockUpdated} variants`);
+    } // end safety guard block
 
     const groups = savedProgress.groups && Object.keys(savedProgress.groups).length
       ? savedProgress.groups
@@ -884,10 +903,11 @@ async function runSync(fullReset = false) {
           if (existingSizeEntry) {
             // This size already exists under a different SKU (Cosmo issued a new
             // lot code) — refresh that variant with fresh price/stock instead of
-            // trying to add a duplicate, which Shopify would reject
-            const refreshed = await refreshExistingVariant(existingSizeEntry.variantId, existingSizeEntry.inventoryItemId, detail, locationId);
+            // trying to add a duplicate, which Shopify would reject. Falls back
+            // to creating fresh if the old variant was already deleted this run.
+            const refreshed = await refreshExistingVariant(existingSizeEntry.variantId, existingSizeEntry.inventoryItemId, detail, locationId, existingProductId);
             if (refreshed) {
-              skuMap[detail.Item] = { productId: existingProductId, variantId: existingSizeEntry.variantId, inventoryItemId: existingSizeEntry.inventoryItemId };
+              skuMap[refreshed.sku] = { productId: existingProductId, variantId: refreshed.variantId, inventoryItemId: refreshed.inventoryItemId };
             }
           } else {
             const newVariant = await addVariantToProduct(existingProductId, detail);
