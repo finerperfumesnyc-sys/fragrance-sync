@@ -785,6 +785,10 @@ async function runSync(fullReset = false) {
       for (const v of variants) {
         const item = cosmoData[v.sku];
         const avail = item ? (item.Available || 0) : undefined;
+        // Temporary diagnostic: trace exactly what happens for known problem SKUs
+        if (v.sku === "YYSMES33-A" || v.sku === "LRBES3-A" || v.sku === "BLOES16-A" || v.sku === "MSFMES2") {
+          console.log(`🔍 DIAGNOSTIC ${v.sku}: found in cosmoData=${!!item}, Available=${item ? item.Available : "N/A"}, computed avail=${avail}`);
+        }
         if (avail === undefined || avail === 0) outVariants.push(v);
         else inVariants.push({ ...v, available: avail, net: item.Net, retail: item.Retail });
       }
