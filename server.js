@@ -413,11 +413,14 @@ async function refreshExistingVariant(variantId, inventoryItemId, detail, locati
     return false;
   }
   if (inventoryItemId && locationId) {
-    await request(
+    const invRes = await request(
       { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/inventory_levels/set.json", method: "POST",
         headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
       { location_id: locationId, inventory_item_id: inventoryItemId, available: detail.Available || 0 }
     );
+    if (invRes.status !== 200 && invRes.status !== 201) {
+      console.log(`⚠️ Failed to set stock for refreshed variant ${variantId} (${detail.Item}): status ${invRes.status} — ${JSON.stringify(invRes.body).slice(0, 150)}`);
+    }
   }
   return { variantId, inventoryItemId, sku: detail.Item };
 }
@@ -765,7 +768,24 @@ async function runSync(fullReset = false) {
     // If SOME sizes are gone -> delete just those size variants, keep the rest for sale
     // If a product comes back in stock later, it's automatically republished
     const cosmoData = {};
-    for (const item of allItems) cosmoData[item.Item] = item;
+    let duplicateItemCodesInFeed = 0;
+    for (const item of allItems) {
+      const existing = cosmoData[item.Item];
+      if (existing) {
+        duplicateItemCodesInFeed++;
+        // Same item code appeared twice in Cosmopolitan's own feed (can happen
+        // across paginated results) — keep whichever shows more stock instead
+        // of letting the later one silently overwrite a correct value
+        if ((item.Available || 0) > (existing.Available || 0)) {
+          cosmoData[item.Item] = item;
+        }
+      } else {
+        cosmoData[item.Item] = item;
+      }
+    }
+    if (duplicateItemCodesInFeed > 0) {
+      console.log(`⚠️ Cosmopolitan's feed listed ${duplicateItemCodesInFeed} item code(s) more than once this cycle — kept whichever showed more stock`);
+    }
 
     const variantsByProduct = {};
     for (const sku of Object.keys(skuMap)) {
@@ -785,12 +805,16 @@ async function runSync(fullReset = false) {
       for (const v of variants) {
         const item = cosmoData[v.sku];
         const avail = item ? (item.Available || 0) : undefined;
-        // Temporary diagnostic: trace exactly what happens for known problem SKUs
-        if (v.sku === "YYSMES33-A" || v.sku === "LRBES3-A" || v.sku === "BLOES16-A" || v.sku === "MSFMES2") {
-          console.log(`🔍 DIAGNOSTIC ${v.sku}: found in cosmoData=${!!item}, Available=${item ? item.Available : "N/A"}, computed avail=${avail}`);
-        }
         if (avail === undefined || avail === 0) outVariants.push(v);
         else inVariants.push({ ...v, available: avail, net: item.Net, retail: item.Retail });
+      }
+
+      // Auto-flag any product where SOME sizes are in stock and others aren't —
+      // this is exactly the pattern to watch for "second size never available"
+      // style bugs, without needing to hardcode specific SKUs to watch
+      if (outVariants.length > 0 && inVariants.length > 0) {
+        const outSkus = outVariants.map(v => v.sku).join(", ");
+        console.log(`🔍 Mixed stock on product ${productId}: ${inVariants.length} size(s) in stock, ${outVariants.length} showing out (${outSkus})`);
       }
 
       if (outVariants.length === variants.length) {
