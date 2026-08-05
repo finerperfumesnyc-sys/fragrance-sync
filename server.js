@@ -270,7 +270,11 @@ async function getLocationId() {
     hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/locations.json", method: "GET",
     headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
   });
-  return res.body?.locations?.[0]?.id;
+  const id = res.body?.locations?.[0]?.id;
+  if (!id) {
+    console.log(`⚠️ getLocationId failed: status ${res.status}, body: ${JSON.stringify(res.body).slice(0, 200)}`);
+  }
+  return id;
 }
 
 async function createShopifyProduct(groupDetails) {
@@ -655,7 +659,17 @@ async function runSync(fullReset = false) {
     const savedProgress = loadProgress();
     const processedGroups = savedProgress.processedGroups || {};
     const { skuMap, titleToProductId, productSizes, productManagedByCosmo } = await getAllShopifySkus();
-    const locationId = await getLocationId();
+    let locationId = await getLocationId();
+    if (!locationId) {
+      console.log(`⚠️ locationId came back empty, retrying once...`);
+      await sleep(2000);
+      locationId = await getLocationId();
+    }
+    if (!locationId) {
+      console.log(`🛑 CRITICAL: Could not get a valid locationId after retry. Every stock/price write in this sync depends on this — aborting this entire run rather than silently skipping all inventory updates.`);
+      syncRunning = false;
+      return;
+    }
     let totalCreated = 0, totalUpdated = 0;
     const allowedLines = ["FRAG", "GIFT", "GSET", "SET", "COFF", "GFTS"];
 
