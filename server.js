@@ -1,15 +1,5 @@
 /**
- * Bloom Fragrances USA - Shopify OAuth + Sync Server (COMPLETE FINAL)
- * Includes:
- * - Checkpoint/resume fix (saves real Phase 1 progress, resumes on restart)
- * - Retry fix (fetchCosmoDetail throws on failure so retries actually work)
- * - Variant dedup fix (prevents "variant already exists" failures)
- * - Shopify 429 rate-limit handling with automatic backoff
- * - updateShopifyProduct — keeps title/description fresh on existing products
- * - Discontinued-item detection (items fully removed from Cosmo's feed -> 0 stock)
- * - inventory_policy: "deny" on EVERY variant, EVERY sync — this is the fix that
- *   actually stops customers from buying items that are out of stock. Without this,
- *   setting inventory to 0 was cosmetic only; Shopify still allowed checkout.
+ * Bloom Fragrances USA - Shopify OAuth + Sync Server (COMPLETE, WITH TARGETED DIAGNOSTIC)
  */
 
 const https = require("https");
@@ -26,6 +16,9 @@ const PROGRESS_FILE = "/tmp/sync_progress.json";
 
 let SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
 let syncRunning = false;
+
+// SKUs to trace in detail this run — answers "pull problem or push problem?"
+const TRACE_SKUS = ["LRBES3-A"];
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 async function request(options, body = null, retryOn429 = true) {
@@ -72,11 +65,9 @@ function loadProgress() {
   } catch(e) {}
   return { processedGroups: {}, groups: {}, lastItemIndex: 0, allItems: null };
 }
-
 function saveProgress(progress) {
   try { fs.writeFileSync(PROGRESS_FILE, JSON.stringify(progress)); } catch(e) {}
 }
-
 function clearProgress() {
   try { if (fs.existsSync(PROGRESS_FILE)) fs.unlinkSync(PROGRESS_FILE); } catch(e) {}
 }
@@ -98,7 +89,6 @@ function extractGender(title) {
   if (title.includes("(U)")) return "U";
   return "U";
 }
-
 function extractSize(title) {
   if (!title) return null;
   const match = title.match(/(\d+\.?\d*)\s*OZ/i);
@@ -109,7 +99,6 @@ function extractSize(title) {
   if (isDamaged) return null;
   return isTester ? `${size} (Tester)` : size;
 }
-
 function extractProductType(title) {
   if (!title) return "Fragrance";
   if (/\bEAU DE PARFUM\b|\bEDP\b/i.test(title)) return "Eau de Parfum";
@@ -119,13 +108,11 @@ function extractProductType(title) {
   if (/\bPARFUM\b/i.test(title)) return "Parfum";
   return "Fragrance";
 }
-
 function extractFragranceName(title) {
   if (!title) return "";
   const name = title.includes("/") ? title.split("/")[0].trim() : title.trim();
   return name.split(" ").map(w => w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : "").join(" ").trim();
 }
-
 function buildGroupKey(detail) {
   const designer = (detail.Designer || "UNKNOWN").toUpperCase().trim();
   const gender = extractGender(detail.Desc || "");
@@ -134,7 +121,6 @@ function buildGroupKey(detail) {
   const fragPart = desc.includes("/") ? desc.split("/")[0].trim() : desc;
   return `${designer}||${fragPart}||${productType}||${gender}`;
 }
-
 function buildProductTitle(details) {
   const first = details[0];
   const designer = first.Designer || "";
@@ -151,7 +137,6 @@ function buildProductTitle(details) {
   title = title.replace(/\s+/g, " ").trim();
   return title;
 }
-
 function buildDescription(details) {
   const first = details[0];
   const designer = first.Designer || "Designer";
@@ -167,10 +152,6 @@ function buildDescription(details) {
     : "";
   return `<p>${designer} ${fragName} ${productType} — a sophisticated ${genderWord} fragrance available in ${sizes || "multiple sizes"}.${typeExplain}</p>`;
 }
-
-// Same as buildDescription but takes an explicit, already-merged size list —
-// used when updating an existing product so the description reflects ALL
-// sizes currently on the product, not just whatever's new in this sync
 function buildDescriptionFromSizeList(first, sizesSorted) {
   const designer = first.Designer || "Designer";
   const fragName = extractFragranceName(first.Desc || first.Item);
@@ -191,7 +172,6 @@ function getInstallUrl(host) {
   const scopes = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory,read_fulfillments,write_fulfillments,read_customers,write_customers";
   return `https://${SHOPIFY_STORE}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(`${host}/auth/callback`)}`;
 }
-
 async function exchangeCodeForToken(code, host) {
   const body = `client_id=${SHOPIFY_CLIENT_ID}&client_secret=${SHOPIFY_CLIENT_SECRET}&code=${code}`;
   const res = await new Promise((resolve, reject) => {
@@ -219,7 +199,6 @@ async function fetchCosmoPage(page) {
   if (res.status !== 200 || !res.body || !res.body.Results) return { items: [], hasMore: false };
   return { items: res.body.Results, hasMore: !!res.body.NextUrl };
 }
-
 async function fetchCosmoDetail(itemCode) {
   const res = await request({
     hostname: "api.cosmopolitanusa.com", path: `/v1/products/${encodeURIComponent(itemCode)}`,
@@ -234,9 +213,9 @@ async function fetchCosmoDetail(itemCode) {
 // ─── SHOPIFY API ─────────────────────────────────────────────────────────────
 async function getAllShopifySkus() {
   let skuMap = {};
-  let titleGroups = {}; // title -> [{id, status, variantCount}]
-  let productSizes = {}; // productId -> { size: {variantId, sku, inventoryItemId} }
-  let productManagedByCosmo = {}; // productId -> true if this sync created it (has "fragrance" tag)
+  let titleGroups = {};
+  let productSizes = {};
+  let productManagedByCosmo = {};
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,status,variants,tags";
   while (true) {
     const res = await request({
@@ -262,9 +241,6 @@ async function getAllShopifySkus() {
       if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break;
     } else break;
   }
-
-  // Build title -> canonical productId, preferring active status then most variants.
-  // Warn when duplicates are found so they can be cleaned up.
   let titleToProductId = {};
   let duplicateTitlesFound = 0;
   for (const title of Object.keys(titleGroups)) {
@@ -281,9 +257,8 @@ async function getAllShopifySkus() {
     titleToProductId[title] = canonical.id;
   }
   if (duplicateTitlesFound > 0) {
-    console.log(`⚠️ Total duplicate product titles: ${duplicateTitlesFound} — these need a one-time cleanup, visit /cleanup-duplicates`);
+    console.log(`⚠️ Total duplicate product titles: ${duplicateTitlesFound} — visit /cleanup-duplicates`);
   }
-
   console.log(`🛍️ Existing Shopify SKUs: ${Object.keys(skuMap).length}`);
   return { skuMap, titleToProductId, productSizes, productManagedByCosmo };
 }
@@ -300,14 +275,11 @@ async function createShopifyProduct(groupDetails) {
   const title = buildProductTitle(groupDetails);
   const description = buildDescription(groupDetails);
   const imageUrl = groupDetails.find(d => d.ImageURL)?.ImageURL?.trim().replace("http://", "https://");
-
   const sorted = [...groupDetails].sort((a, b) => {
     const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     return sizeA - sizeB;
   });
-
-  // Dedupe by size — if two Cosmopolitan items share the same size, keep the one with more stock
   const bySize = {};
   for (const detail of sorted) {
     const size = extractSize(detail.Desc || "") || "One Size";
@@ -320,25 +292,18 @@ async function createShopifyProduct(groupDetails) {
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     return sizeA - sizeB;
   });
-
   const variants = sortedDetails.map(detail => {
     const size = extractSize(detail.Desc || "") || "One Size";
     return {
-      option1: size,
-      sku: detail.Item,
+      option1: size, sku: detail.Item,
       price: calculatePrice(detail.Net, detail.Retail),
       compare_at_price: detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null,
-      inventory_management: "shopify",
-      inventory_policy: "deny", // stops purchase once stock hits 0
+      inventory_management: "shopify", inventory_policy: "deny",
       inventory_quantity: detail.Available || 0,
-      weight: parseFloat(detail.Weight || 0),
-      weight_unit: "oz",
-      fulfillment_service: "manual",
-      requires_shipping: true,
-      taxable: true
+      weight: parseFloat(detail.Weight || 0), weight_unit: "oz",
+      fulfillment_service: "manual", requires_shipping: true, taxable: true
     };
   });
-
   const res = await request(
     { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/products.json", method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
@@ -347,13 +312,11 @@ async function createShopifyProduct(groupDetails) {
         vendor: groupDetails[0].Designer || "Cosmopolitan Cosmetics",
         product_type: extractProductType(groupDetails[0].Desc || ""),
         tags: ["fragrance", groupDetails[0].ProductLine, extractGender(groupDetails[0].Desc || "")].filter(Boolean).join(", "),
-        options: [{ name: "Size" }],
-        variants,
+        options: [{ name: "Size" }], variants,
         images: imageUrl ? [{ src: imageUrl }] : []
       }
     }
   );
-
   if (res.status === 201) {
     console.log(`✅ Created: ${title} (${variants.length} size${variants.length > 1 ? "s" : ""})`);
     return res.body.product;
@@ -364,8 +327,6 @@ async function createShopifyProduct(groupDetails) {
 
 async function updateShopifyProduct(productId, groupDetails, existingSizes) {
   const title = buildProductTitle(groupDetails);
-  // Merge sizes already on the product with the new ones being added, so the
-  // description never drops sizes that were added in a previous sync
   const allSizeLabels = new Set();
   if (existingSizes) for (const size of Object.keys(existingSizes)) allSizeLabels.add(size);
   for (const d of groupDetails) {
@@ -389,9 +350,6 @@ async function updateShopifyProduct(productId, groupDetails, existingSizes) {
   return res.status === 200;
 }
 
-// When Cosmopolitan issues a new item code for a size that already exists on the
-// product (e.g. a new inventory lot), update the existing variant with the fresher
-// data instead of trying to add a duplicate size (which Shopify would reject).
 async function refreshExistingVariant(variantId, inventoryItemId, detail, locationId, productId) {
   const price = calculatePrice(detail.Net, detail.Retail);
   const compareAtPrice = detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null;
@@ -401,9 +359,6 @@ async function refreshExistingVariant(variantId, inventoryItemId, detail, locati
     { variant: { id: variantId, sku: detail.Item, price, compare_at_price: compareAtPrice, inventory_policy: "deny" } }
   );
   if (res.status === 404 && productId) {
-    // The target variant was already deleted earlier in this same sync (e.g. an
-    // old item code hit 0 stock and got removed before this new one could take
-    // its place) — fall back to creating it fresh instead of losing the size
     console.log(`🔁 Variant ${variantId} no longer exists — creating a fresh variant for ${detail.Item} instead`);
     const newVariant = await addVariantToProduct(productId, detail);
     return newVariant ? { variantId: newVariant.id, inventoryItemId: newVariant.inventory_item_id, sku: newVariant.sku } : false;
@@ -434,8 +389,7 @@ async function addVariantToProduct(productId, detail) {
         option1: size, sku: detail.Item,
         price: calculatePrice(detail.Net, detail.Retail),
         compare_at_price: detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null,
-        inventory_management: "shopify",
-        inventory_policy: "deny", // stops purchase once stock hits 0
+        inventory_management: "shopify", inventory_policy: "deny",
         inventory_quantity: detail.Available || 0,
         weight: parseFloat(detail.Weight || 0), weight_unit: "oz",
         fulfillment_service: "manual", requires_shipping: true, taxable: true
@@ -449,9 +403,29 @@ async function addVariantToProduct(productId, detail) {
   return res.body.variant;
 }
 
-// Sets stock level AND forces inventory_policy to "deny" so 0 stock actually blocks
-// checkout. Takes inventoryItemId directly (fetched once upfront) instead of doing
-// a GET per call - this cuts API calls per item from 3 down to 2.
+async function updateInventory(variantId, inventoryItemId, available, locationId, price, compareAtPrice) {
+  if (!inventoryItemId || !locationId) return;
+  const variantUpdate = { id: variantId, inventory_policy: "deny" };
+  if (price) variantUpdate.price = price;
+  if (compareAtPrice) variantUpdate.compare_at_price = compareAtPrice;
+  const variantRes = await request(
+    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "PUT",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+    { variant: variantUpdate }
+  );
+  if (variantRes.status !== 200) {
+    console.log(`⚠️ Variant update failed for ${variantId}: status ${variantRes.status} — ${JSON.stringify(variantRes.body).slice(0, 150)}`);
+  }
+  const invRes = await request(
+    { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/inventory_levels/set.json", method: "POST",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+    { location_id: locationId, inventory_item_id: inventoryItemId, available }
+  );
+  if (invRes.status !== 200 && invRes.status !== 201) {
+    console.log(`⚠️ Inventory update failed for ${variantId}: status ${invRes.status}`);
+  }
+}
+
 async function deleteVariant(productId, variantId) {
   const res = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}/variants/${variantId}.json`, method: "DELETE",
@@ -474,11 +448,19 @@ async function deleteProduct(productId) {
   return res.status === 200;
 }
 
+async function setProductStatus(productId, status) {
+  const res = await request(
+    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}.json`, method: "PUT",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+    { product: { id: productId, status } }
+  );
+  if (res.status !== 200) {
+    console.log(`⚠️ Failed to set product ${productId} to ${status}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
+  }
+  return res.status === 200;
+}
+
 // ─── ONE-TIME DUPLICATE CLEANUP ────────────────────────────────────────────
-// Finds products that share the exact same title (created before the
-// duplicate-prevention fix existed), merges all their unique sizes into one
-// canonical product (preferring the active one with the most variants), and
-// deletes the leftover duplicate product shells.
 async function cleanupDuplicates() {
   console.log("🧹 Duplicate cleanup starting...");
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,status,variants,tags";
@@ -496,22 +478,18 @@ async function cleanupDuplicates() {
     } else break;
   }
   console.log(`🧹 Scanned ${allProducts.length} total products`);
-
   const byTitle = {};
   for (const p of allProducts) {
     const tags = (p.tags || "").split(",").map(t => t.trim().toLowerCase());
-    if (!tags.includes("fragrance")) continue; // only touch products this sync manages
+    if (!tags.includes("fragrance")) continue;
     if (!byTitle[p.title]) byTitle[p.title] = [];
     byTitle[p.title].push(p);
   }
-
   let mergedGroups = 0, variantsMoved = 0, sizesSkippedDuplicate = 0, productsDeleted = 0;
-
   for (const title of Object.keys(byTitle)) {
     const group = byTitle[title];
     if (group.length < 2) continue;
     mergedGroups++;
-
     const sorted = group.slice().sort((a, b) => {
       if (a.status === "active" && b.status !== "active") return -1;
       if (b.status === "active" && a.status !== "active") return 1;
@@ -519,21 +497,15 @@ async function cleanupDuplicates() {
     });
     const canonical = sorted[0];
     const duplicates = sorted.slice(1);
-
     const canonicalSizes = {};
     for (const v of canonical.variants || []) {
       if (v.option1) canonicalSizes[v.option1] = true;
     }
-
     console.log(`🧹 Merging "${title}": canonical=${canonical.id} (${canonical.status}, ${(canonical.variants||[]).length} sizes), ${duplicates.length} duplicate(s) to merge in`);
-
     for (const dup of duplicates) {
       for (const v of dup.variants || []) {
         const size = v.option1 || "One Size";
-        if (canonicalSizes[size]) {
-          sizesSkippedDuplicate++;
-          continue; // canonical already has this size, skip the duplicate's copy
-        }
+        if (canonicalSizes[size]) { sizesSkippedDuplicate++; continue; }
         const res = await request(
           { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${canonical.id}/variants.json`, method: "POST",
             headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
@@ -545,67 +517,20 @@ async function cleanupDuplicates() {
             }
           }
         );
-        if (res.status === 201) {
-          variantsMoved++;
-          canonicalSizes[size] = true;
-        } else {
-          console.log(`⚠️ Failed to move size ${size} (sku ${v.sku}) into canonical product ${canonical.id}: status ${res.status}`);
-        }
+        if (res.status === 201) { variantsMoved++; canonicalSizes[size] = true; }
+        else console.log(`⚠️ Failed to move size ${size} (sku ${v.sku}) into canonical product ${canonical.id}: status ${res.status}`);
         await sleep(300);
       }
-
       const deleted = await deleteProduct(dup.id);
       if (deleted) productsDeleted++;
       await sleep(300);
     }
-
-    // Make sure the canonical product is published if it has any real stock
-    const hasStock = (canonical.variants || []).some(v => (v.inventory_quantity || 0) > 0)
-      || variantsMoved > 0;
+    const hasStock = (canonical.variants || []).some(v => (v.inventory_quantity || 0) > 0) || variantsMoved > 0;
     if (hasStock) await setProductStatus(canonical.id, "active");
     await sleep(200);
   }
-
   console.log(`🧹 Cleanup complete: ${mergedGroups} duplicate title groups merged, ${variantsMoved} sizes moved, ${sizesSkippedDuplicate} redundant sizes skipped, ${productsDeleted} duplicate products deleted`);
   return { mergedGroups, variantsMoved, sizesSkippedDuplicate, productsDeleted };
-}
-
-async function setProductStatus(productId, status) {
-  const res = await request(
-    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}.json`, method: "PUT",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { product: { id: productId, status } }
-  );
-  if (res.status !== 200) {
-    console.log(`⚠️ Failed to set product ${productId} to ${status}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
-  }
-  return res.status === 200;
-}
-
-async function updateInventory(variantId, inventoryItemId, available, locationId, price, compareAtPrice) {
-  if (!inventoryItemId || !locationId) return;
-
-  const variantUpdate = { id: variantId, inventory_policy: "deny" };
-  if (price) variantUpdate.price = price;
-  if (compareAtPrice) variantUpdate.compare_at_price = compareAtPrice;
-
-  const variantRes = await request(
-    { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "PUT",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { variant: variantUpdate }
-  );
-  if (variantRes.status !== 200) {
-    console.log(`⚠️ Variant update failed for ${variantId}: status ${variantRes.status} — ${JSON.stringify(variantRes.body).slice(0, 150)}`);
-  }
-
-  const invRes = await request(
-    { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/inventory_levels/set.json", method: "POST",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { location_id: locationId, inventory_item_id: inventoryItemId, available }
-  );
-  if (invRes.status !== 200 && invRes.status !== 201) {
-    console.log(`⚠️ Inventory update failed for ${variantId}: status ${invRes.status}`);
-  }
 }
 
 // ─── ORDERS ──────────────────────────────────────────────────────────────────
@@ -723,10 +648,8 @@ async function runSync(fullReset = false) {
     if (fullReset) clearProgress();
     const savedProgress = loadProgress();
     const processedGroups = savedProgress.processedGroups || {};
-
     const { skuMap, titleToProductId, productSizes, productManagedByCosmo } = await getAllShopifySkus();
     const locationId = await getLocationId();
-
     let totalCreated = 0, totalUpdated = 0;
     const allowedLines = ["FRAG", "GIFT", "GSET", "SET", "COFF", "GFTS"];
 
@@ -751,40 +674,36 @@ async function runSync(fullReset = false) {
       saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems });
     }
 
-    // ── SAFETY GUARD ──
-    // If Cosmopolitan returned suspiciously few items (a fraction of what your
-    // store actually has), something went wrong with the fetch — do NOT treat
-    // this as "everything is out of stock." Skip the hide/unpublish pass entirely
-    // rather than risk wrongly hiding the whole catalog.
+    // TARGETED TRACE — pull side: is this SKU even present in what we collected?
+    for (const traceSku of TRACE_SKUS) {
+      const found = allItems.find(i => i.Item === traceSku);
+      if (found) {
+        console.log(`🎯 TRACE ${traceSku}: FOUND in Cosmopolitan collection. Available=${found.Available}, raw item: ${JSON.stringify(found).slice(0, 300)}`);
+      } else {
+        console.log(`🎯 TRACE ${traceSku}: NOT FOUND anywhere in this cycle's ${allItems.length} collected items — this is a PULL-side problem (item missing from what we fetched, or a mismatched item code).`);
+      }
+    }
+
     const existingSkuCount = Object.keys(skuMap).length;
     const minimumExpectedItems = Math.floor(existingSkuCount * 0.5);
     let unpublished = 0, variantsRemoved = 0, republished = 0, stockUpdated = 0;
     if (allItems.length < minimumExpectedItems) {
-      console.log(`🛑 SAFETY ABORT: Only got ${allItems.length} items from Cosmopolitan but store has ${existingSkuCount} SKUs. This looks like a failed fetch, not a real inventory change. Skipping the hide/unpublish pass this cycle to avoid wrongly hiding products.`);
+      console.log(`🛑 SAFETY ABORT: Only got ${allItems.length} items from Cosmopolitan but store has ${existingSkuCount} SKUs. Skipping the hide/unpublish pass this cycle.`);
     } else {
 
-    // ── Remove/hide anything not currently available on Cosmopolitan ──
-    // If ALL sizes of a product are gone/out of stock -> unpublish the whole product
-    // If SOME sizes are gone -> delete just those size variants, keep the rest for sale
-    // If a product comes back in stock later, it's automatically republished
     const cosmoData = {};
     let duplicateItemCodesInFeed = 0;
     for (const item of allItems) {
       const existing = cosmoData[item.Item];
       if (existing) {
         duplicateItemCodesInFeed++;
-        // Same item code appeared twice in Cosmopolitan's own feed (can happen
-        // across paginated results) — keep whichever shows more stock instead
-        // of letting the later one silently overwrite a correct value
-        if ((item.Available || 0) > (existing.Available || 0)) {
-          cosmoData[item.Item] = item;
-        }
+        if ((item.Available || 0) > (existing.Available || 0)) cosmoData[item.Item] = item;
       } else {
         cosmoData[item.Item] = item;
       }
     }
     if (duplicateItemCodesInFeed > 0) {
-      console.log(`⚠️ Cosmopolitan's feed listed ${duplicateItemCodesInFeed} item code(s) more than once this cycle — kept whichever showed more stock`);
+      console.log(`⚠️ Cosmopolitan's feed listed ${duplicateItemCodesInFeed} item code(s) more than once this cycle`);
     }
 
     const variantsByProduct = {};
@@ -795,8 +714,6 @@ async function runSync(fullReset = false) {
     }
 
     for (const productId of Object.keys(variantsByProduct)) {
-      // Never touch products that weren't created by this sync (no "fragrance"
-      // tag) — protects manually-added products from being hidden/modified
       if (productManagedByCosmo[productId] === false) continue;
 
       const variants = variantsByProduct[productId];
@@ -805,13 +722,16 @@ async function runSync(fullReset = false) {
       for (const v of variants) {
         const item = cosmoData[v.sku];
         const avail = item ? (item.Available || 0) : undefined;
+
+        // TARGETED TRACE — push side: what does the bulk pass decide for this SKU?
+        if (TRACE_SKUS.includes(v.sku)) {
+          console.log(`🎯 TRACE ${v.sku}: in bulk pass — found in cosmoData=${!!item}, Available=${item ? item.Available : "N/A"}, computed avail=${avail}, decision=${(avail === undefined || avail === 0) ? "OUT (will delete or leave deleted)" : "IN (will refresh stock/price)"}`);
+        }
+
         if (avail === undefined || avail === 0) outVariants.push(v);
         else inVariants.push({ ...v, available: avail, net: item.Net, retail: item.Retail });
       }
 
-      // Auto-flag any product where SOME sizes are in stock and others aren't —
-      // this is exactly the pattern to watch for "second size never available"
-      // style bugs, without needing to hardcode specific SKUs to watch
       if (outVariants.length > 0 && inVariants.length > 0) {
         const outSkus = outVariants.map(v => v.sku).join(", ");
         console.log(`🔍 Mixed stock on product ${productId}: ${inVariants.length} size(s) in stock, ${outVariants.length} showing out (${outSkus})`);
@@ -823,6 +743,9 @@ async function runSync(fullReset = false) {
         await sleep(200);
       } else {
         for (const v of outVariants) {
+          if (TRACE_SKUS.includes(v.sku)) {
+            console.log(`🎯 TRACE ${v.sku}: about to DELETE this variant (product has other in-stock sizes)`);
+          }
           await deleteVariant(productId, v.variantId);
           variantsRemoved++;
           await sleep(200);
@@ -835,6 +758,9 @@ async function runSync(fullReset = false) {
       }
 
       for (const v of inVariants) {
+        if (TRACE_SKUS.includes(v.sku)) {
+          console.log(`🎯 TRACE ${v.sku}: about to WRITE stock=${v.available}, price data to Shopify`);
+        }
         const freshDetail = await withRetry(() => fetchCosmoDetail(v.sku));
         let freshPrice, freshCompareAt;
         if (freshDetail) {
@@ -854,22 +780,17 @@ async function runSync(fullReset = false) {
     console.log(`🗑️ Removed ${variantsRemoved} discontinued size variants`);
     console.log(`🔄 Republished ${republished} restocked products`);
     console.log(`📦 Updated stock on ${stockUpdated} variants`);
-    } // end safety guard block
+    }
 
     const groups = savedProgress.groups && Object.keys(savedProgress.groups).length
-      ? savedProgress.groups
-      : {};
+      ? savedProgress.groups : {};
     const startIndex = savedProgress.lastItemIndex || 0;
     const seenProductLines = new Set();
 
     console.log(`🔍 Phase 1: Fetching all product details and grouping (resuming from item ${startIndex})...`);
     for (let i = startIndex; i < allItems.length; i++) {
       const item = allItems[i];
-
-      // Existing SKUs already handled in the bulk pass above (stock/hide/delete/republish)
-      if (skuMap[item.Item]) {
-        continue;
-      }
+      if (skuMap[item.Item]) { continue; }
 
       const detail = await withRetry(() => fetchCosmoDetail(item.Item));
       if (!detail) {
@@ -899,12 +820,8 @@ async function runSync(fullReset = false) {
     for (let g = 0; g < groupKeys.length; g++) {
       const key = groupKeys[g];
       const groupDetails = groups[key];
-
       if (processedGroups[key]) continue;
 
-      // Check both: does this exact SKU already exist, OR does a product with the
-      // same computed title (same fragrance/designer/type/gender) already exist,
-      // even though this specific new SIZE hasn't been added yet.
       const skuMatch = groupDetails.find(d => skuMap[d.Item]);
       const computedTitle = buildProductTitle(groupDetails);
       const titleMatchProductId = titleToProductId[computedTitle];
@@ -912,9 +829,6 @@ async function runSync(fullReset = false) {
 
       if (existingProductId) {
         await updateShopifyProduct(existingProductId, groupDetails, productSizes[existingProductId]);
-
-        // Dedupe new items by size before adding — if two Cosmo items share a size,
-        // keep the one with more stock, same protection as new-product creation
         const newItems = groupDetails.filter(d => !skuMap[d.Item]);
         const bySizeToAdd = {};
         for (const detail of newItems) {
@@ -923,16 +837,10 @@ async function runSync(fullReset = false) {
             bySizeToAdd[size] = detail;
           }
         }
-
         for (const detail of Object.values(bySizeToAdd)) {
           const size = extractSize(detail.Desc || "") || "One Size";
           const existingSizeEntry = productSizes[existingProductId] && productSizes[existingProductId][size];
-
           if (existingSizeEntry) {
-            // This size already exists under a different SKU (Cosmo issued a new
-            // lot code) — refresh that variant with fresh price/stock instead of
-            // trying to add a duplicate, which Shopify would reject. Falls back
-            // to creating fresh if the old variant was already deleted this run.
             const refreshed = await refreshExistingVariant(existingSizeEntry.variantId, existingSizeEntry.inventoryItemId, detail, locationId, existingProductId);
             if (refreshed) {
               skuMap[refreshed.sku] = { productId: existingProductId, variantId: refreshed.variantId, inventoryItemId: refreshed.inventoryItemId };
@@ -947,14 +855,10 @@ async function runSync(fullReset = false) {
           }
           await sleep(300);
         }
-
-        // A new size means this fragrance is back in stock — make sure the product
-        // is published even if it was hidden earlier (in this run or a previous one)
         if (Object.values(bySizeToAdd).length > 0) {
           await setProductStatus(existingProductId, "active");
           await sleep(200);
         }
-
         processedGroups[key] = existingProductId;
         totalUpdated++;
       } else {
