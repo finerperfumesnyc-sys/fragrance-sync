@@ -17,8 +17,10 @@ const PROGRESS_FILE = "/tmp/sync_progress.json";
 let SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
 let syncRunning = false;
 
-// SKUs to trace in detail this run — answers "pull problem or push problem?"
-const TRACE_SKUS = ["LRBES3-A"];
+// SKUs to trace in detail this run — LRBES3-A is broken, LRBES17-A is its
+// sibling variant on the SAME product that DOES show correct stock. Comparing
+// them side by side in the same run should isolate the real difference.
+const TRACE_SKUS = ["LRBES3-A", "LRBES17-A"];
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 async function request(options, body = null, retryOn429 = true) {
@@ -404,7 +406,7 @@ async function addVariantToProduct(productId, detail) {
 }
 
 async function updateInventory(variantId, inventoryItemId, available, locationId, price, compareAtPrice) {
-  if (!inventoryItemId || !locationId) return;
+  if (!inventoryItemId || !locationId) return { skipped: true, reason: "missing inventoryItemId or locationId" };
   const variantUpdate = { id: variantId, inventory_policy: "deny" };
   if (price) variantUpdate.price = price;
   if (compareAtPrice) variantUpdate.compare_at_price = compareAtPrice;
@@ -424,6 +426,10 @@ async function updateInventory(variantId, inventoryItemId, available, locationId
   if (invRes.status !== 200 && invRes.status !== 201) {
     console.log(`⚠️ Inventory update failed for ${variantId}: status ${invRes.status}`);
   }
+  return {
+    variantStatus: variantRes.status, variantBody: JSON.stringify(variantRes.body).slice(0, 200),
+    invStatus: invRes.status, invBody: JSON.stringify(invRes.body).slice(0, 200)
+  };
 }
 
 async function deleteVariant(productId, variantId) {
@@ -759,7 +765,7 @@ async function runSync(fullReset = false) {
 
       for (const v of inVariants) {
         if (TRACE_SKUS.includes(v.sku)) {
-          console.log(`🎯 TRACE ${v.sku}: about to WRITE stock=${v.available}, price data to Shopify`);
+          console.log(`🎯 TRACE ${v.sku}: about to WRITE — variantId=${v.variantId}, inventoryItemId=${v.inventoryItemId}, target stock=${v.available}`);
         }
         const freshDetail = await withRetry(() => fetchCosmoDetail(v.sku));
         let freshPrice, freshCompareAt;
@@ -771,7 +777,10 @@ async function runSync(fullReset = false) {
           freshPrice = null;
           freshCompareAt = null;
         }
-        await updateInventory(v.variantId, v.inventoryItemId, v.available, locationId, freshPrice, freshCompareAt);
+        const writeResult = await updateInventory(v.variantId, v.inventoryItemId, v.available, locationId, freshPrice, freshCompareAt);
+        if (TRACE_SKUS.includes(v.sku)) {
+          console.log(`🎯 TRACE ${v.sku}: WRITE RESULT — ${JSON.stringify(writeResult)}`);
+        }
         stockUpdated++;
         await sleep(250);
       }
