@@ -171,7 +171,7 @@ function buildDescriptionFromSizeList(first, sizesSorted) {
 
 // ─── OAUTH ───────────────────────────────────────────────────────────────────
 function getInstallUrl(host) {
-  const scopes = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory,read_fulfillments,write_fulfillments,read_customers,write_customers";
+  const scopes = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory,read_fulfillments,write_fulfillments,read_customers,write_customers,read_locations";
   return `https://${SHOPIFY_STORE}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${scopes}&redirect_uri=${encodeURIComponent(`${host}/auth/callback`)}`;
 }
 async function exchangeCodeForToken(code, host) {
