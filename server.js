@@ -192,6 +192,46 @@ async function exchangeCodeForToken(code, host) {
   return res.body.access_token;
 }
 
+// This app's tokens expire every ~24 hours (client_credentials grant). This
+// function gets a fresh one automatically at the start of every sync, so the
+// token never has a chance to go stale and require manual regeneration.
+async function refreshShopifyToken() {
+  if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+    console.log("⚠️ Cannot auto-refresh token — SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET not set");
+    return false;
+  }
+  const body = `grant_type=client_credentials&client_id=${SHOPIFY_CLIENT_ID}&client_secret=${SHOPIFY_CLIENT_SECRET}`;
+  try {
+    const res = await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: SHOPIFY_STORE, path: "/admin/oauth/access_token", method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(body) }
+      }, (res) => {
+        let data = "";
+        res.on("data", c => data += c);
+        res.on("end", () => {
+          try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+          catch { resolve({ status: res.statusCode, body: data }); }
+        });
+      });
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+    if (res.body && res.body.access_token) {
+      SHOPIFY_TOKEN = res.body.access_token;
+      console.log(`🔑 Token auto-refreshed successfully (scope: ${res.body.scope ? res.body.scope.slice(0, 100) + "..." : "unknown"})`);
+      return true;
+    } else {
+      console.log(`⚠️ Token refresh failed: ${JSON.stringify(res.body).slice(0, 200)}`);
+      return false;
+    }
+  } catch (err) {
+    console.log(`⚠️ Token refresh error: ${err.message}`);
+    return false;
+  }
+}
+
 // ─── COSMOPOLITAN API ────────────────────────────────────────────────────────
 async function fetchCosmoPage(page) {
   const res = await request({
@@ -649,10 +689,18 @@ async function syncTracking() {
 
 // ─── MAIN SYNC ────────────────────────────────────────────────────────────────
 async function runSync(fullReset = false) {
-  if (!SHOPIFY_TOKEN) { console.log("⚠️ No token — visit /install"); return; }
   if (syncRunning) { console.log("⚠️ Sync already running"); return; }
   syncRunning = true;
   console.log("🌸 Bloom Fragrances USA - Sync starting...", new Date().toISOString());
+
+  // Auto-refresh the token every run — this app's tokens expire every ~24
+  // hours, so relying on the old static one would silently break every day
+  const refreshed = await refreshShopifyToken();
+  if (!refreshed && !SHOPIFY_TOKEN) {
+    console.log("🛑 No valid token available (auto-refresh failed and no existing token) — aborting sync");
+    syncRunning = false;
+    return;
+  }
 
   try {
     if (fullReset) clearProgress();
