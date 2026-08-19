@@ -320,7 +320,6 @@ async function getLocationId() {
 async function createShopifyProduct(groupDetails) {
   const title = buildProductTitle(groupDetails);
   const description = buildDescription(groupDetails);
-  const imageUrl = groupDetails.find(d => d.ImageURL)?.ImageURL?.trim().replace("http://", "https://");
   const sorted = [...groupDetails].sort((a, b) => {
     const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
@@ -338,6 +337,13 @@ async function createShopifyProduct(groupDetails) {
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     return sizeA - sizeB;
   });
+
+  // Collect every UNIQUE image across all sizes (not just the first one found),
+  // so each size can show its own bottle photo instead of one shared image
+  const uniqueImageUrls = [...new Set(
+    sortedDetails.map(d => d.ImageURL?.trim().replace("http://", "https://")).filter(Boolean)
+  )];
+
   const variants = sortedDetails.map(detail => {
     const size = extractSize(detail.Desc || "") || "One Size";
     return {
@@ -350,6 +356,7 @@ async function createShopifyProduct(groupDetails) {
       fulfillment_service: "manual", requires_shipping: true, taxable: true
     };
   });
+
   const res = await request(
     { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/products.json", method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
@@ -359,16 +366,39 @@ async function createShopifyProduct(groupDetails) {
         product_type: extractProductType(groupDetails[0].Desc || ""),
         tags: ["fragrance", groupDetails[0].ProductLine, extractGender(groupDetails[0].Desc || "")].filter(Boolean).join(", "),
         options: [{ name: "Size" }], variants,
-        images: imageUrl ? [{ src: imageUrl }] : []
+        images: uniqueImageUrls.map(src => ({ src }))
       }
     }
   );
-  if (res.status === 201) {
-    console.log(`✅ Created: ${title} (${variants.length} size${variants.length > 1 ? "s" : ""})`);
-    return res.body.product;
+  if (res.status !== 201) {
+    console.log(`⚠️ Failed: ${title} — ${JSON.stringify(res.body).slice(0, 150)}`);
+    return null;
   }
-  console.log(`⚠️ Failed: ${title} — ${JSON.stringify(res.body).slice(0, 150)}`);
-  return null;
+  console.log(`✅ Created: ${title} (${variants.length} size${variants.length > 1 ? "s" : ""})`);
+
+  // Now link each variant to ITS specific image, if it has a different one
+  // than the others (Shopify only supports this after the images have IDs)
+  if (uniqueImageUrls.length > 1) {
+    const createdImages = res.body.product.images || [];
+    for (const createdVariant of res.body.product.variants || []) {
+      const originalDetail = sortedDetails.find(d => d.Item === createdVariant.sku);
+      const detailImageUrl = originalDetail?.ImageURL?.trim().replace("http://", "https://");
+      const matchingImage = createdImages.find(img => img.src === detailImageUrl);
+      if (matchingImage) {
+        const linkRes = await request(
+          { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${createdVariant.id}.json`, method: "PUT",
+            headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+          { variant: { id: createdVariant.id, image_id: matchingImage.id } }
+        );
+        if (linkRes.status !== 200) {
+          console.log(`⚠️ Failed to link image to variant ${createdVariant.sku}: status ${linkRes.status}`);
+        }
+        await sleep(200);
+      }
+    }
+  }
+
+  return res.body.product;
 }
 
 async function updateShopifyProduct(productId, groupDetails, existingSizes) {
@@ -508,6 +538,110 @@ async function setProductStatus(productId, status) {
     console.log(`⚠️ Failed to set product ${productId} to ${status}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
   }
   return res.status === 200;
+}
+
+// ─── ONE-TIME FIX: LINK VARIANT IMAGES ON EXISTING PRODUCTS ────────────────
+// New products now get correct per-size images automatically. This is a
+// one-time pass to fix products that already existed before that fix — for
+// each multi-size product, checks if Cosmopolitan has different photos per
+// size, uploads any missing ones, and links each variant to its own image.
+async function fixVariantImages() {
+  console.log("🖼️ Variant image fix starting...");
+  let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,tags,images,variants";
+  let allProducts = [];
+  while (true) {
+    const res = await request({
+      hostname: SHOPIFY_STORE, path, method: "GET",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
+    });
+    allProducts = allProducts.concat(res.body.products || []);
+    const link = res.headers?.link || "";
+    if (link.includes('rel="next"')) {
+      const m = link.match(/<([^>]+)>;\s*rel="next"/);
+      if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break;
+    } else break;
+  }
+  console.log(`🖼️ Scanned ${allProducts.length} total products`);
+
+  const multiVariantFragranceProducts = allProducts.filter(p => {
+    const tags = (p.tags || "").split(",").map(t => t.trim().toLowerCase());
+    return tags.includes("fragrance") && (p.variants || []).length > 1;
+  });
+  console.log(`🖼️ ${multiVariantFragranceProducts.length} multi-size fragrance products to check`);
+
+  let productsFixed = 0, variantsLinked = 0, imagesUploaded = 0, skippedSameImage = 0, errors = 0;
+
+  for (const product of multiVariantFragranceProducts) {
+    // Fetch each variant's real current Cosmopolitan image by SKU
+    const skuToImageUrl = {};
+    let hasMultipleDistinctImages = false;
+    const seenUrls = new Set();
+
+    for (const v of product.variants) {
+      if (!v.sku) continue;
+      const detail = await withRetry(() => fetchCosmoDetail(v.sku));
+      if (detail && detail.ImageURL) {
+        const url = detail.ImageURL.trim().replace("http://", "https://");
+        skuToImageUrl[v.sku] = url;
+        seenUrls.add(url);
+      }
+      await sleep(200);
+    }
+    hasMultipleDistinctImages = seenUrls.size > 1;
+
+    if (!hasMultipleDistinctImages) {
+      skippedSameImage++;
+      continue; // nothing to differentiate — all sizes share the same photo (or no data)
+    }
+
+    // Make sure every needed image actually exists on the product, uploading any missing ones
+    const existingImagesBySrc = {};
+    for (const img of product.images || []) existingImagesBySrc[img.src] = img;
+
+    for (const url of seenUrls) {
+      if (!existingImagesBySrc[url]) {
+        const uploadRes = await request(
+          { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${product.id}/images.json`, method: "POST",
+            headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+          { image: { src: url } }
+        );
+        if (uploadRes.status === 200 || uploadRes.status === 201) {
+          existingImagesBySrc[url] = uploadRes.body.image;
+          imagesUploaded++;
+        } else {
+          console.log(`⚠️ Failed to upload image for product ${product.id}: status ${uploadRes.status}`);
+          errors++;
+        }
+        await sleep(300);
+      }
+    }
+
+    // Link each variant to its correct image
+    let anyLinked = false;
+    for (const v of product.variants) {
+      const url = skuToImageUrl[v.sku];
+      const image = url ? existingImagesBySrc[url] : null;
+      if (image && v.image_id !== image.id) {
+        const linkRes = await request(
+          { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${v.id}.json`, method: "PUT",
+            headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+          { variant: { id: v.id, image_id: image.id } }
+        );
+        if (linkRes.status === 200) {
+          variantsLinked++;
+          anyLinked = true;
+        } else {
+          console.log(`⚠️ Failed to link image for variant ${v.sku}: status ${linkRes.status}`);
+          errors++;
+        }
+        await sleep(250);
+      }
+    }
+    if (anyLinked) productsFixed++;
+  }
+
+  console.log(`🖼️ Variant image fix complete: ${productsFixed} products fixed, ${variantsLinked} variants linked, ${imagesUploaded} images uploaded, ${skippedSameImage} products skipped (same image for all sizes), ${errors} errors`);
+  return { productsFixed, variantsLinked, imagesUploaded, skippedSameImage, errors };
 }
 
 // ─── ONE-TIME DUPLICATE CLEANUP ────────────────────────────────────────────
@@ -1015,6 +1149,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("Duplicate cleanup started! Check logs.");
     cleanupDuplicates();
+  }
+  else if (path === "/fix-variant-images") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Variant image fix started! Check logs.");
+    fixVariantImages();
   }
   else { res.writeHead(404); res.end("Not found"); }
 });
