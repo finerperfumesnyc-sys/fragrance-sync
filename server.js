@@ -1,5 +1,5 @@
 /**
- * Bloom Fragrances USA - Shopify OAuth + Sync Server (COMPLETE, WITH TARGETED DIAGNOSTIC)
+ * Bloom Fragrances USA - Shopify OAuth + Sync Server (COMPLETE)
  */
 
 const https = require("https");
@@ -17,9 +17,6 @@ const PROGRESS_FILE = "/tmp/sync_progress.json";
 let SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
 let syncRunning = false;
 
-// SKUs to trace in detail this run — LRBES3-A is broken, LRBES17-A is its
-// sibling variant on the SAME product that DOES show correct stock. Comparing
-// them side by side in the same run should isolate the real difference.
 const TRACE_SKUS = ["LRBES3-A", "LRBES17-A"];
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
@@ -45,34 +42,23 @@ async function request(options, body = null, retryOn429 = true) {
   }
   return result;
 }
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 async function withRetry(fn, retries = 3, delayMs = 1000) {
   for (let i = 0; i < retries; i++) {
-    try {
-      const result = await fn();
-      return result;
-    } catch (err) {
+    try { return await fn(); }
+    catch (err) {
       console.log(`⚠️ Attempt ${i+1} failed: ${err.message}. ${i < retries-1 ? "Retrying..." : "Giving up."}`);
       if (i < retries - 1) await sleep(delayMs * (i + 1));
     }
   }
   return null;
 }
-
 function loadProgress() {
-  try {
-    if (fs.existsSync(PROGRESS_FILE)) return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8"));
-  } catch(e) {}
+  try { if (fs.existsSync(PROGRESS_FILE)) return JSON.parse(fs.readFileSync(PROGRESS_FILE, "utf8")); } catch(e) {}
   return { processedGroups: {}, groups: {}, lastItemIndex: 0, allItems: null };
 }
-function saveProgress(progress) {
-  try { fs.writeFileSync(PROGRESS_FILE, JSON.stringify(progress)); } catch(e) {}
-}
-function clearProgress() {
-  try { if (fs.existsSync(PROGRESS_FILE)) fs.unlinkSync(PROGRESS_FILE); } catch(e) {}
-}
+function saveProgress(p) { try { fs.writeFileSync(PROGRESS_FILE, JSON.stringify(p)); } catch(e) {} }
+function clearProgress() { try { if (fs.existsSync(PROGRESS_FILE)) fs.unlinkSync(PROGRESS_FILE); } catch(e) {} }
 
 // ─── PRICING ────────────────────────────────────────────────────────────────
 function calculatePrice(wholesale, retail) {
@@ -88,7 +74,6 @@ function extractGender(title) {
   if (!title) return "U";
   if (title.includes("(M)")) return "M";
   if (title.includes("(W)")) return "W";
-  if (title.includes("(U)")) return "U";
   return "U";
 }
 function extractSize(title) {
@@ -97,8 +82,7 @@ function extractSize(title) {
   if (!match) return null;
   const size = `${match[1]} oz`;
   const isTester = /TESTER|NO CAP|UNBOXED/i.test(title);
-  const isDamaged = /SLIGHTLY DAMAGED/i.test(title);
-  if (isDamaged) return null;
+  if (/SLIGHTLY DAMAGED/i.test(title)) return null;
   return isTester ? `${size} (Tester)` : size;
 }
 function extractProductType(title) {
@@ -131,12 +115,9 @@ function buildProductTitle(details) {
   const gender = extractGender(first.Desc || "");
   const genderLabel = gender === "M" ? "for Men" : gender === "W" ? "for Women" : "";
   let cleanFragName = fragName;
-  if (cleanFragName.toUpperCase().startsWith(designer.toUpperCase())) {
-    cleanFragName = cleanFragName.slice(designer.length).trim();
-  }
+  if (cleanFragName.toUpperCase().startsWith(designer.toUpperCase())) cleanFragName = cleanFragName.slice(designer.length).trim();
   let title = (designer + " " + cleanFragName + " " + productType + " " + genderLabel).trim();
-  title = title.replace(/\bSpray\b/gi, "");
-  title = title.replace(/\s+/g, " ").trim();
+  title = title.replace(/\bSpray\b/gi, "").replace(/\s+/g, " ").trim();
   return title;
 }
 function buildDescription(details) {
@@ -150,8 +131,7 @@ function buildDescription(details) {
   const typeExplain = productType === "Eau de Parfum" ? " Eau de Parfum offers a rich, long-lasting scent that lingers throughout the day."
     : productType === "Eau de Toilette" ? " Eau de Toilette is a lighter, fresh concentration perfect for everyday wear."
     : productType === "Cologne" ? " A light, refreshing concentration ideal for daily use."
-    : productType === "Parfum" ? " Parfum is the most concentrated and longest-lasting fragrance formulation."
-    : "";
+    : productType === "Parfum" ? " Parfum is the most concentrated and longest-lasting fragrance formulation." : "";
   return `<p>${designer} ${fragName} ${productType} — a sophisticated ${genderWord} fragrance available in ${sizes || "multiple sizes"}.${typeExplain}</p>`;
 }
 function buildDescriptionFromSizeList(first, sizesSorted) {
@@ -164,8 +144,7 @@ function buildDescriptionFromSizeList(first, sizesSorted) {
   const typeExplain = productType === "Eau de Parfum" ? " Eau de Parfum offers a rich, long-lasting scent that lingers throughout the day."
     : productType === "Eau de Toilette" ? " Eau de Toilette is a lighter, fresh concentration perfect for everyday wear."
     : productType === "Cologne" ? " A light, refreshing concentration ideal for daily use."
-    : productType === "Parfum" ? " Parfum is the most concentrated and longest-lasting fragrance formulation."
-    : "";
+    : productType === "Parfum" ? " Parfum is the most concentrated and longest-lasting fragrance formulation." : "";
   return `<p>${designer} ${fragName} ${productType} — a sophisticated ${genderWord} fragrance available in ${sizes || "multiple sizes"}.${typeExplain}</p>`;
 }
 
@@ -177,24 +156,13 @@ function getInstallUrl(host) {
 async function exchangeCodeForToken(code, host) {
   const body = `client_id=${SHOPIFY_CLIENT_ID}&client_secret=${SHOPIFY_CLIENT_SECRET}&code=${code}`;
   const res = await new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: SHOPIFY_STORE, path: "/admin/oauth/access_token", method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(body) }
-    }, (res) => {
-      let data = "";
-      res.on("data", c => data += c);
-      res.on("end", () => resolve({ body: JSON.parse(data) }));
-    });
-    req.on("error", reject);
-    req.write(body);
-    req.end();
+    const req = https.request({ hostname: SHOPIFY_STORE, path: "/admin/oauth/access_token", method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(body) } },
+      (res) => { let data = ""; res.on("data", c => data += c); res.on("end", () => resolve({ body: JSON.parse(data) })); });
+    req.on("error", reject); req.write(body); req.end();
   });
   return res.body.access_token;
 }
-
-// This app's tokens expire every ~24 hours (client_credentials grant). This
-// function gets a fresh one automatically at the start of every sync, so the
-// token never has a chance to go stale and require manual regeneration.
 async function refreshShopifyToken() {
   if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
     console.log("⚠️ Cannot auto-refresh token — SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET not set");
@@ -203,29 +171,20 @@ async function refreshShopifyToken() {
   const body = `grant_type=client_credentials&client_id=${SHOPIFY_CLIENT_ID}&client_secret=${SHOPIFY_CLIENT_SECRET}`;
   try {
     const res = await new Promise((resolve, reject) => {
-      const req = https.request({
-        hostname: SHOPIFY_STORE, path: "/admin/oauth/access_token", method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(body) }
-      }, (res) => {
-        let data = "";
-        res.on("data", c => data += c);
-        res.on("end", () => {
-          try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
-          catch { resolve({ status: res.statusCode, body: data }); }
-        });
-      });
-      req.on("error", reject);
-      req.write(body);
-      req.end();
+      const req = https.request({ hostname: SHOPIFY_STORE, path: "/admin/oauth/access_token", method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(body) } },
+        (res) => { let data = ""; res.on("data", c => data += c); res.on("end", () => {
+          try { resolve({ status: res.statusCode, body: JSON.parse(data) }); } catch { resolve({ status: res.statusCode, body: data }); }
+        }); });
+      req.on("error", reject); req.write(body); req.end();
     });
     if (res.body && res.body.access_token) {
       SHOPIFY_TOKEN = res.body.access_token;
-      console.log(`🔑 Token auto-refreshed successfully (scope: ${res.body.scope ? res.body.scope.slice(0, 100) + "..." : "unknown"})`);
+      console.log(`🔑 Token auto-refreshed successfully`);
       return true;
-    } else {
-      console.log(`⚠️ Token refresh failed: ${JSON.stringify(res.body).slice(0, 200)}`);
-      return false;
     }
+    console.log(`⚠️ Token refresh failed: ${JSON.stringify(res.body).slice(0, 200)}`);
+    return false;
   } catch (err) {
     console.log(`⚠️ Token refresh error: ${err.message}`);
     return false;
@@ -234,41 +193,27 @@ async function refreshShopifyToken() {
 
 // ─── COSMOPOLITAN API ────────────────────────────────────────────────────────
 async function fetchCosmoPage(page) {
-  const res = await request({
-    hostname: "api.cosmopolitanusa.com", path: `/v1/products?page=${page}`,
-    method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
-  });
+  const res = await request({ hostname: "api.cosmopolitanusa.com", path: `/v1/products?page=${page}`,
+    method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } });
   if (res.status !== 200 || !res.body || !res.body.Results) return { items: [], hasMore: false };
   return { items: res.body.Results, hasMore: !!res.body.NextUrl };
 }
 async function fetchCosmoDetail(itemCode) {
-  const res = await request({
-    hostname: "api.cosmopolitanusa.com", path: `/v1/products/${encodeURIComponent(itemCode)}`,
-    method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
-  });
-  if (res.status !== 200 || !res.body) {
-    throw new Error(`Cosmo detail fetch failed for ${itemCode}, status ${res.status}`);
-  }
+  const res = await request({ hostname: "api.cosmopolitanusa.com", path: `/v1/products/${encodeURIComponent(itemCode)}`,
+    method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } });
+  if (res.status !== 200 || !res.body) throw new Error(`Cosmo detail fetch failed for ${itemCode}, status ${res.status}`);
   return res.body;
 }
 
 // ─── SHOPIFY API ─────────────────────────────────────────────────────────────
 async function getAllShopifySkus() {
-  let skuMap = {};
-  let titleGroups = {};
-  let productSizes = {};
-  let productManagedByCosmo = {};
+  let skuMap = {}, titleGroups = {}, productSizes = {}, productManagedByCosmo = {};
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,status,variants,tags";
   while (true) {
-    const res = await request({
-      hostname: SHOPIFY_STORE, path, method: "GET",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
-    });
+    const res = await request({ hostname: SHOPIFY_STORE, path, method: "GET",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
     for (const p of res.body.products || []) {
-      if (p.title) {
-        if (!titleGroups[p.title]) titleGroups[p.title] = [];
-        titleGroups[p.title].push({ id: p.id, status: p.status, variantCount: (p.variants || []).length });
-      }
+      if (p.title) { if (!titleGroups[p.title]) titleGroups[p.title] = []; titleGroups[p.title].push({ id: p.id, status: p.status, variantCount: (p.variants || []).length }); }
       if (!productSizes[p.id]) productSizes[p.id] = {};
       const tags = (p.tags || "").split(",").map(t => t.trim().toLowerCase());
       productManagedByCosmo[p.id] = tags.includes("fragrance");
@@ -278,19 +223,12 @@ async function getAllShopifySkus() {
       }
     }
     const link = res.headers?.link || "";
-    if (link.includes('rel="next"')) {
-      const m = link.match(/<([^>]+)>;\s*rel="next"/);
-      if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break;
-    } else break;
+    if (link.includes('rel="next"')) { const m = link.match(/<([^>]+)>;\s*rel="next"/); if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break; } else break;
   }
-  let titleToProductId = {};
-  let duplicateTitlesFound = 0;
+  let titleToProductId = {}, duplicateTitlesFound = 0;
   for (const title of Object.keys(titleGroups)) {
     const group = titleGroups[title];
-    if (group.length > 1) {
-      duplicateTitlesFound++;
-      console.log(`⚠️ Duplicate title found: "${title}" (${group.length} products) — run /cleanup-duplicates to merge these`);
-    }
+    if (group.length > 1) { duplicateTitlesFound++; console.log(`⚠️ Duplicate title found: "${title}" (${group.length} products) — run /cleanup-duplicates to merge these`); }
     const canonical = group.slice().sort((a, b) => {
       if (a.status === "active" && b.status !== "active") return -1;
       if (b.status === "active" && a.status !== "active") return 1;
@@ -298,22 +236,15 @@ async function getAllShopifySkus() {
     })[0];
     titleToProductId[title] = canonical.id;
   }
-  if (duplicateTitlesFound > 0) {
-    console.log(`⚠️ Total duplicate product titles: ${duplicateTitlesFound} — visit /cleanup-duplicates`);
-  }
+  if (duplicateTitlesFound > 0) console.log(`⚠️ Total duplicate product titles: ${duplicateTitlesFound} — visit /cleanup-duplicates`);
   console.log(`🛍️ Existing Shopify SKUs: ${Object.keys(skuMap).length}`);
   return { skuMap, titleToProductId, productSizes, productManagedByCosmo };
 }
-
 async function getLocationId() {
-  const res = await request({
-    hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/locations.json", method: "GET",
-    headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
-  });
+  const res = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/locations.json", method: "GET",
+    headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
   const id = res.body?.locations?.[0]?.id;
-  if (!id) {
-    console.log(`⚠️ getLocationId failed: status ${res.status}, body: ${JSON.stringify(res.body).slice(0, 200)}`);
-  }
+  if (!id) console.log(`⚠️ getLocationId failed: status ${res.status}, body: ${JSON.stringify(res.body).slice(0, 200)}`);
   return id;
 }
 
@@ -328,56 +259,31 @@ async function createShopifyProduct(groupDetails) {
   const bySize = {};
   for (const detail of sorted) {
     const size = extractSize(detail.Desc || "") || "One Size";
-    if (!bySize[size] || (detail.Available || 0) > (bySize[size].Available || 0)) {
-      bySize[size] = detail;
-    }
+    if (!bySize[size] || (detail.Available || 0) > (bySize[size].Available || 0)) bySize[size] = detail;
   }
   const sortedDetails = Object.values(bySize).sort((a, b) => {
     const sizeA = parseFloat((a.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     return sizeA - sizeB;
   });
-
-  // Collect every UNIQUE image across all sizes (not just the first one found),
-  // so each size can show its own bottle photo instead of one shared image
-  const uniqueImageUrls = [...new Set(
-    sortedDetails.map(d => d.ImageURL?.trim().replace("http://", "https://")).filter(Boolean)
-  )];
-
+  const uniqueImageUrls = [...new Set(sortedDetails.map(d => d.ImageURL?.trim().replace("http://", "https://")).filter(Boolean))];
   const variants = sortedDetails.map(detail => {
     const size = extractSize(detail.Desc || "") || "One Size";
-    return {
-      option1: size, sku: detail.Item,
-      price: calculatePrice(detail.Net, detail.Retail),
+    return { option1: size, sku: detail.Item, price: calculatePrice(detail.Net, detail.Retail),
       compare_at_price: detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null,
-      inventory_management: "shopify", inventory_policy: "deny",
-      inventory_quantity: detail.Available || 0,
-      weight: parseFloat(detail.Weight || 0), weight_unit: "oz",
-      fulfillment_service: "manual", requires_shipping: true, taxable: true
-    };
+      inventory_management: "shopify", inventory_policy: "deny", inventory_quantity: detail.Available || 0,
+      weight: parseFloat(detail.Weight || 0), weight_unit: "oz", fulfillment_service: "manual", requires_shipping: true, taxable: true };
   });
-
   const res = await request(
     { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/products.json", method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { product: {
-        title, body_html: description,
-        vendor: groupDetails[0].Designer || "Cosmopolitan Cosmetics",
+    { product: { title, body_html: description, vendor: groupDetails[0].Designer || "Cosmopolitan Cosmetics",
         product_type: extractProductType(groupDetails[0].Desc || ""),
         tags: ["fragrance", groupDetails[0].ProductLine, extractGender(groupDetails[0].Desc || "")].filter(Boolean).join(", "),
-        options: [{ name: "Size" }], variants,
-        images: uniqueImageUrls.map(src => ({ src }))
-      }
-    }
+        options: [{ name: "Size" }], variants, images: uniqueImageUrls.map(src => ({ src })) } }
   );
-  if (res.status !== 201) {
-    console.log(`⚠️ Failed: ${title} — ${JSON.stringify(res.body).slice(0, 150)}`);
-    return null;
-  }
+  if (res.status !== 201) { console.log(`⚠️ Failed: ${title} — ${JSON.stringify(res.body).slice(0, 150)}`); return null; }
   console.log(`✅ Created: ${title} (${variants.length} size${variants.length > 1 ? "s" : ""})`);
-
-  // Now link each variant to ITS specific image, if it has a different one
-  // than the others (Shopify only supports this after the images have IDs)
   if (uniqueImageUrls.length > 1) {
     const createdImages = res.body.product.images || [];
     for (const createdVariant of res.body.product.variants || []) {
@@ -390,14 +296,11 @@ async function createShopifyProduct(groupDetails) {
             headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
           { variant: { id: createdVariant.id, image_id: matchingImage.id } }
         );
-        if (linkRes.status !== 200) {
-          console.log(`⚠️ Failed to link image to variant ${createdVariant.sku}: status ${linkRes.status}`);
-        }
+        if (linkRes.status !== 200) console.log(`⚠️ Failed to link image to variant ${createdVariant.sku}: status ${linkRes.status}`);
         await sleep(200);
       }
     }
   }
-
   return res.body.product;
 }
 
@@ -405,24 +308,17 @@ async function updateShopifyProduct(productId, groupDetails, existingSizes) {
   const title = buildProductTitle(groupDetails);
   const allSizeLabels = new Set();
   if (existingSizes) for (const size of Object.keys(existingSizes)) allSizeLabels.add(size);
-  for (const d of groupDetails) {
-    const s = extractSize(d.Desc || "");
-    if (s && !s.includes("Tester")) allSizeLabels.add(s);
-  }
+  for (const d of groupDetails) { const s = extractSize(d.Desc || ""); if (s && !s.includes("Tester")) allSizeLabels.add(s); }
   const sizesSorted = Array.from(allSizeLabels).sort((a, b) => parseFloat(a) - parseFloat(b));
   const description = buildDescriptionFromSizeList(groupDetails[0], sizesSorted);
   const res = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}.json`, method: "PUT",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { product: { id: productId, title, body_html: description,
-        vendor: groupDetails[0].Designer || "Cosmopolitan Cosmetics",
+    { product: { id: productId, title, body_html: description, vendor: groupDetails[0].Designer || "Cosmopolitan Cosmetics",
         product_type: extractProductType(groupDetails[0].Desc || "") } }
   );
-  if (res.status === 200) {
-    console.log(`🔄 Updated: ${title}`);
-  } else {
-    console.log(`⚠️ Product update failed for ${productId} (${title}): status ${res.status}`);
-  }
+  if (res.status === 200) console.log(`🔄 Updated: ${title}`);
+  else console.log(`⚠️ Product update failed for ${productId} (${title}): status ${res.status}`);
   return res.status === 200;
 }
 
@@ -449,9 +345,7 @@ async function refreshExistingVariant(variantId, inventoryItemId, detail, locati
         headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
       { location_id: locationId, inventory_item_id: inventoryItemId, available: detail.Available || 0 }
     );
-    if (invRes.status !== 200 && invRes.status !== 201) {
-      console.log(`⚠️ Failed to set stock for refreshed variant ${variantId} (${detail.Item}): status ${invRes.status} — ${JSON.stringify(invRes.body).slice(0, 150)}`);
-    }
+    if (invRes.status !== 200 && invRes.status !== 201) console.log(`⚠️ Failed to set stock for refreshed variant ${variantId} (${detail.Item}): status ${invRes.status}`);
   }
   return { variantId, inventoryItemId, sku: detail.Item };
 }
@@ -461,21 +355,12 @@ async function addVariantToProduct(productId, detail) {
   const res = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}/variants.json`, method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { variant: {
-        option1: size, sku: detail.Item,
-        price: calculatePrice(detail.Net, detail.Retail),
+    { variant: { option1: size, sku: detail.Item, price: calculatePrice(detail.Net, detail.Retail),
         compare_at_price: detail.Retail ? parseFloat(detail.Retail).toFixed(2) : null,
-        inventory_management: "shopify", inventory_policy: "deny",
-        inventory_quantity: detail.Available || 0,
-        weight: parseFloat(detail.Weight || 0), weight_unit: "oz",
-        fulfillment_service: "manual", requires_shipping: true, taxable: true
-      }
-    }
+        inventory_management: "shopify", inventory_policy: "deny", inventory_quantity: detail.Available || 0,
+        weight: parseFloat(detail.Weight || 0), weight_unit: "oz", fulfillment_service: "manual", requires_shipping: true, taxable: true } }
   );
-  if (res.status !== 201) {
-    console.log(`⚠️ Failed to add variant ${detail.Item} (${size}) to product ${productId}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 200)}`);
-    return null;
-  }
+  if (res.status !== 201) { console.log(`⚠️ Failed to add variant ${detail.Item} (${size}) to product ${productId}: status ${res.status}`); return null; }
   return res.body.variant;
 }
 
@@ -486,83 +371,51 @@ async function updateInventory(variantId, inventoryItemId, available, locationId
   if (compareAtPrice) variantUpdate.compare_at_price = compareAtPrice;
   const variantRes = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${variantId}.json`, method: "PUT",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { variant: variantUpdate }
-  );
-  if (variantRes.status !== 200) {
-    console.log(`⚠️ Variant update failed for ${variantId}: status ${variantRes.status} — ${JSON.stringify(variantRes.body).slice(0, 150)}`);
-  }
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } }, { variant: variantUpdate });
+  if (variantRes.status !== 200) console.log(`⚠️ Variant update failed for ${variantId}: status ${variantRes.status} — ${JSON.stringify(variantRes.body).slice(0, 150)}`);
   const invRes = await request(
     { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/inventory_levels/set.json", method: "POST",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { location_id: locationId, inventory_item_id: inventoryItemId, available }
-  );
-  if (invRes.status !== 200 && invRes.status !== 201) {
-    console.log(`⚠️ Inventory update failed for ${variantId}: status ${invRes.status}`);
-  }
-  return {
-    variantStatus: variantRes.status, variantBody: JSON.stringify(variantRes.body).slice(0, 200),
-    invStatus: invRes.status, invBody: JSON.stringify(invRes.body).slice(0, 200)
-  };
+    { location_id: locationId, inventory_item_id: inventoryItemId, available });
+  if (invRes.status !== 200 && invRes.status !== 201) console.log(`⚠️ Inventory update failed for ${variantId}: status ${invRes.status}`);
+  return { variantStatus: variantRes.status, variantBody: JSON.stringify(variantRes.body).slice(0, 200), invStatus: invRes.status, invBody: JSON.stringify(invRes.body).slice(0, 200) };
 }
 
 async function deleteVariant(productId, variantId) {
   const res = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}/variants/${variantId}.json`, method: "DELETE",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } }
-  );
-  if (res.status !== 200) {
-    console.log(`⚠️ Failed to delete variant ${variantId} from product ${productId}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
-  }
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
+  if (res.status !== 200) console.log(`⚠️ Failed to delete variant ${variantId} from product ${productId}: status ${res.status}`);
   return res.status === 200;
 }
-
 async function deleteProduct(productId) {
   const res = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}.json`, method: "DELETE",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } }
-  );
-  if (res.status !== 200) {
-    console.log(`⚠️ Failed to delete duplicate product ${productId}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
-  }
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
+  if (res.status !== 200) console.log(`⚠️ Failed to delete duplicate product ${productId}: status ${res.status}`);
   return res.status === 200;
 }
-
 async function setProductStatus(productId, status) {
   const res = await request(
     { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}.json`, method: "PUT",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-    { product: { id: productId, status } }
-  );
-  if (res.status !== 200) {
-    console.log(`⚠️ Failed to set product ${productId} to ${status}: status ${res.status} — ${JSON.stringify(res.body).slice(0, 150)}`);
-  }
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } }, { product: { id: productId, status } });
+  if (res.status !== 200) console.log(`⚠️ Failed to set product ${productId} to ${status}: status ${res.status}`);
   return res.status === 200;
 }
 
 // ─── ONE-TIME FIX: LINK VARIANT IMAGES ON EXISTING PRODUCTS ────────────────
-// New products now get correct per-size images automatically. This is a
-// one-time pass to fix products that already existed before that fix — for
-// each multi-size product, checks if Cosmopolitan has different photos per
-// size, uploads any missing ones, and links each variant to its own image.
 async function fixVariantImages() {
   console.log("🖼️ Variant image fix starting...");
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,tags,images,variants";
   let allProducts = [];
   while (true) {
-    const res = await request({
-      hostname: SHOPIFY_STORE, path, method: "GET",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
-    });
+    const res = await request({ hostname: SHOPIFY_STORE, path, method: "GET",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
     allProducts = allProducts.concat(res.body.products || []);
     const link = res.headers?.link || "";
-    if (link.includes('rel="next"')) {
-      const m = link.match(/<([^>]+)>;\s*rel="next"/);
-      if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break;
-    } else break;
+    if (link.includes('rel="next"')) { const m = link.match(/<([^>]+)>;\s*rel="next"/); if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break; } else break;
   }
   console.log(`🖼️ Scanned ${allProducts.length} total products`);
-
   const multiVariantFragranceProducts = allProducts.filter(p => {
     const tags = (p.tags || "").split(",").map(t => t.trim().toLowerCase());
     return tags.includes("fragrance") && (p.variants || []).length > 1;
@@ -571,69 +424,56 @@ async function fixVariantImages() {
 
   let productsFixed = 0, variantsLinked = 0, imagesUploaded = 0, skippedSameImage = 0, errors = 0;
 
-  for (const product of multiVariantFragranceProducts) {
-    // Fetch each variant's real current Cosmopolitan image by SKU
-    const skuToImageUrl = {};
-    let hasMultipleDistinctImages = false;
-    const seenUrls = new Set();
+  for (let i = 0; i < multiVariantFragranceProducts.length; i++) {
+    const product = multiVariantFragranceProducts[i];
 
+    if (i % 10 === 0) {
+      console.log(`🖼️ Progress: ${i}/${multiVariantFragranceProducts.length} products checked — ${productsFixed} fixed so far, ${skippedSameImage} skipped (same image)`);
+    }
+
+    const skuToImageUrl = {};
+    const seenUrls = new Set();
     for (const v of product.variants) {
       if (!v.sku) continue;
       const detail = await withRetry(() => fetchCosmoDetail(v.sku));
       if (detail && detail.ImageURL) {
-        const url = detail.ImageURL.trim().replace("http://", "https://");
-        skuToImageUrl[v.sku] = url;
-        seenUrls.add(url);
+        const imgUrl = detail.ImageURL.trim().replace("http://", "https://");
+        skuToImageUrl[v.sku] = imgUrl;
+        seenUrls.add(imgUrl);
       }
       await sleep(200);
     }
-    hasMultipleDistinctImages = seenUrls.size > 1;
 
-    if (!hasMultipleDistinctImages) {
-      skippedSameImage++;
-      continue; // nothing to differentiate — all sizes share the same photo (or no data)
-    }
+    if (seenUrls.size <= 1) { skippedSameImage++; continue; }
 
-    // Make sure every needed image actually exists on the product, uploading any missing ones
     const existingImagesBySrc = {};
     for (const img of product.images || []) existingImagesBySrc[img.src] = img;
 
-    for (const url of seenUrls) {
-      if (!existingImagesBySrc[url]) {
+    for (const imgUrl of seenUrls) {
+      if (!existingImagesBySrc[imgUrl]) {
         const uploadRes = await request(
           { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${product.id}/images.json`, method: "POST",
             headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-          { image: { src: url } }
+          { image: { src: imgUrl } }
         );
-        if (uploadRes.status === 200 || uploadRes.status === 201) {
-          existingImagesBySrc[url] = uploadRes.body.image;
-          imagesUploaded++;
-        } else {
-          console.log(`⚠️ Failed to upload image for product ${product.id}: status ${uploadRes.status}`);
-          errors++;
-        }
+        if (uploadRes.status === 200 || uploadRes.status === 201) { existingImagesBySrc[imgUrl] = uploadRes.body.image; imagesUploaded++; }
+        else { console.log(`⚠️ Failed to upload image for product ${product.id}: status ${uploadRes.status}`); errors++; }
         await sleep(300);
       }
     }
 
-    // Link each variant to its correct image
     let anyLinked = false;
     for (const v of product.variants) {
-      const url = skuToImageUrl[v.sku];
-      const image = url ? existingImagesBySrc[url] : null;
+      const imgUrl = skuToImageUrl[v.sku];
+      const image = imgUrl ? existingImagesBySrc[imgUrl] : null;
       if (image && v.image_id !== image.id) {
         const linkRes = await request(
           { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${v.id}.json`, method: "PUT",
             headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
           { variant: { id: v.id, image_id: image.id } }
         );
-        if (linkRes.status === 200) {
-          variantsLinked++;
-          anyLinked = true;
-        } else {
-          console.log(`⚠️ Failed to link image for variant ${v.sku}: status ${linkRes.status}`);
-          errors++;
-        }
+        if (linkRes.status === 200) { variantsLinked++; anyLinked = true; }
+        else { console.log(`⚠️ Failed to link image for variant ${v.sku}: status ${linkRes.status}`); errors++; }
         await sleep(250);
       }
     }
@@ -650,16 +490,11 @@ async function cleanupDuplicates() {
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,status,variants,tags";
   let allProducts = [];
   while (true) {
-    const res = await request({
-      hostname: SHOPIFY_STORE, path, method: "GET",
-      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
-    });
+    const res = await request({ hostname: SHOPIFY_STORE, path, method: "GET",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
     allProducts = allProducts.concat(res.body.products || []);
     const link = res.headers?.link || "";
-    if (link.includes('rel="next"')) {
-      const m = link.match(/<([^>]+)>;\s*rel="next"/);
-      if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break;
-    } else break;
+    if (link.includes('rel="next"')) { const m = link.match(/<([^>]+)>;\s*rel="next"/); if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break; } else break;
   }
   console.log(`🧹 Scanned ${allProducts.length} total products`);
   const byTitle = {};
@@ -682,9 +517,7 @@ async function cleanupDuplicates() {
     const canonical = sorted[0];
     const duplicates = sorted.slice(1);
     const canonicalSizes = {};
-    for (const v of canonical.variants || []) {
-      if (v.option1) canonicalSizes[v.option1] = true;
-    }
+    for (const v of canonical.variants || []) if (v.option1) canonicalSizes[v.option1] = true;
     console.log(`🧹 Merging "${title}": canonical=${canonical.id} (${canonical.status}, ${(canonical.variants||[]).length} sizes), ${duplicates.length} duplicate(s) to merge in`);
     for (const dup of duplicates) {
       for (const v of dup.variants || []) {
@@ -693,16 +526,11 @@ async function cleanupDuplicates() {
         const res = await request(
           { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${canonical.id}/variants.json`, method: "POST",
             headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-          { variant: {
-              option1: size, sku: v.sku, price: v.price, compare_at_price: v.compare_at_price,
-              inventory_management: "shopify", inventory_policy: "deny",
-              inventory_quantity: v.inventory_quantity || 0,
-              fulfillment_service: "manual", requires_shipping: true, taxable: true
-            }
-          }
-        );
+          { variant: { option1: size, sku: v.sku, price: v.price, compare_at_price: v.compare_at_price,
+              inventory_management: "shopify", inventory_policy: "deny", inventory_quantity: v.inventory_quantity || 0,
+              fulfillment_service: "manual", requires_shipping: true, taxable: true } });
         if (res.status === 201) { variantsMoved++; canonicalSizes[size] = true; }
-        else console.log(`⚠️ Failed to move size ${size} (sku ${v.sku}) into canonical product ${canonical.id}: status ${res.status}`);
+        else console.log(`⚠️ Failed to move size ${size} (sku ${v.sku}): status ${res.status}`);
         await sleep(300);
       }
       const deleted = await deleteProduct(dup.id);
@@ -719,103 +547,65 @@ async function cleanupDuplicates() {
 
 // ─── ORDERS ──────────────────────────────────────────────────────────────────
 async function processOrders() {
-  const res = await request({
-    hostname: SHOPIFY_STORE,
-    path: "/admin/api/2024-01/orders.json?fulfillment_status=unfulfilled&status=open&limit=50",
-    method: "GET",
-    headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
-  });
+  const res = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/orders.json?fulfillment_status=unfulfilled&status=open&limit=50",
+    method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
   const orders = res.body.orders || [];
   let submitted = 0;
   for (const order of orders) {
     if ((order.tags || "").includes("cosmo-submitted")) continue;
     const shipping = order.shipping_address;
     if (!shipping) continue;
-    const suborder = {
-      Suborder: `BLOOM-${order.order_number}`,
-      ShipTo: {
-        Name: `${shipping.first_name} ${shipping.last_name}`.trim(),
-        Line1: shipping.address1, Line2: shipping.address2 || undefined,
-        City: shipping.city, State: shipping.province_code, Zip: shipping.zip,
-        Country: shipping.country_code, Phone: shipping.phone || undefined,
-        Email: order.email || undefined, Residence: true
-      },
-      Lines: order.line_items.map(item => ({
-        SKU: item.sku, QTY: item.quantity,
-        NET: parseFloat(item.price || 0).toFixed(2),
-        EndPrice: shipping.country_code !== "US" ? parseFloat(item.price).toFixed(2) : undefined
-      }))
-    };
+    const suborder = { Suborder: `BLOOM-${order.order_number}`,
+      ShipTo: { Name: `${shipping.first_name} ${shipping.last_name}`.trim(), Line1: shipping.address1, Line2: shipping.address2 || undefined,
+        City: shipping.city, State: shipping.province_code, Zip: shipping.zip, Country: shipping.country_code,
+        Phone: shipping.phone || undefined, Email: order.email || undefined, Residence: true },
+      Lines: order.line_items.map(item => ({ SKU: item.sku, QTY: item.quantity, NET: parseFloat(item.price || 0).toFixed(2),
+        EndPrice: shipping.country_code !== "US" ? parseFloat(item.price).toFixed(2) : undefined })) };
     const subRes = await request(
       { hostname: "api.cosmopolitanusa.com", path: "/v1/suborders", method: "POST",
-        headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } },
-      suborder
-    );
+        headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } }, suborder);
     if (subRes.status === 201 || subRes.status === 200) {
       submitted++;
       console.log(`✅ Submitted order BLOOM-${order.order_number}`);
-      await request(
-        { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}.json`, method: "PUT",
-          headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-        { order: { id: order.id, tags: ((order.tags || "") + ",cosmo-submitted").replace(/^,/, "") } }
-      );
+      await request({ hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}.json`, method: "PUT",
+        headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+        { order: { id: order.id, tags: ((order.tags || "") + ",cosmo-submitted").replace(/^,/, "") } });
     }
     await sleep(300);
   }
   if (submitted > 0) {
     const today = new Date().toISOString().split("T")[0].replace(/-/g, "");
-    await request(
-      { hostname: "api.cosmopolitanusa.com", path: "/v1/dropship", method: "POST",
-        headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } },
-      { PO: `BLOOM-PO-${today}`, Comment: "Bloom Fragrances USA daily order" }
-    );
+    await request({ hostname: "api.cosmopolitanusa.com", path: "/v1/dropship", method: "POST",
+      headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } },
+      { PO: `BLOOM-PO-${today}`, Comment: "Bloom Fragrances USA daily order" });
     console.log(`✅ Dropship PO submitted`);
   }
 }
-
 async function syncTracking() {
-  const res = await request({
-    hostname: SHOPIFY_STORE,
-    path: "/admin/api/2024-01/orders.json?fulfillment_status=unfulfilled&status=open&limit=50",
-    method: "GET",
-    headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
-  });
-  const orders = (res.body.orders || []).filter(o =>
-    (o.tags || "").includes("cosmo-submitted") && !(o.tags || "").includes("cosmo-tracked")
-  );
+  const res = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/orders.json?fulfillment_status=unfulfilled&status=open&limit=50",
+    method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
+  const orders = (res.body.orders || []).filter(o => (o.tags || "").includes("cosmo-submitted") && !(o.tags || "").includes("cosmo-tracked"));
   for (const order of orders) {
     const orderNum = `BLOOM-${order.order_number}`;
-    const trackRes = await request({
-      hostname: "api.cosmopolitanusa.com", path: `/v1/dropship/suborder/${encodeURIComponent(orderNum)}`,
-      method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" }
-    });
+    const trackRes = await request({ hostname: "api.cosmopolitanusa.com", path: `/v1/dropship/suborder/${encodeURIComponent(orderNum)}`,
+      method: "GET", headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } });
     const tracking = trackRes.body?.Shipments?.[0]?.TrackingNumber;
     const carrier = trackRes.body?.Shipments?.[0]?.Carrier || "other";
     if (!tracking) continue;
-    const foRes = await request({
-      hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}/fulfillment_orders.json`,
-      method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" }
-    });
+    const foRes = await request({ hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}/fulfillment_orders.json`,
+      method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
     const fulfillmentOrderId = foRes.body?.fulfillment_orders?.[0]?.id;
     if (!fulfillmentOrderId) continue;
     const carrierMap = { FEDEX: "FedEx", UPS: "UPS", USPS: "USPS", FEDGND: "FedEx", UPSGND: "UPS", USPSP: "USPS" };
-    const fulfillRes = await request(
-      { hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/fulfillments.json", method: "POST",
-        headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-      { fulfillment: {
-          line_items_by_fulfillment_order: [{ fulfillment_order_id: fulfillmentOrderId }],
-          tracking_info: { number: tracking, company: carrierMap[carrier.toUpperCase()] || carrier },
-          notify_customer: true
-        }
-      }
-    );
+    const fulfillRes = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/fulfillments.json", method: "POST",
+      headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+      { fulfillment: { line_items_by_fulfillment_order: [{ fulfillment_order_id: fulfillmentOrderId }],
+          tracking_info: { number: tracking, company: carrierMap[carrier.toUpperCase()] || carrier }, notify_customer: true } });
     if (fulfillRes.status === 201) {
       console.log(`✅ Tracked order ${orderNum}`);
-      await request(
-        { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}.json`, method: "PUT",
-          headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-        { order: { id: order.id, tags: ((order.tags || "") + ",cosmo-tracked").replace(/^,/, "") } }
-      );
+      await request({ hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}.json`, method: "PUT",
+        headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+        { order: { id: order.id, tags: ((order.tags || "") + ",cosmo-tracked").replace(/^,/, "") } });
     }
     await sleep(500);
   }
@@ -827,11 +617,9 @@ async function runSync(fullReset = false) {
   syncRunning = true;
   console.log("🌸 Bloom Fragrances USA - Sync starting...", new Date().toISOString());
 
-  // Auto-refresh the token every run — this app's tokens expire every ~24
-  // hours, so relying on the old static one would silently break every day
   const refreshed = await refreshShopifyToken();
   if (!refreshed && !SHOPIFY_TOKEN) {
-    console.log("🛑 No valid token available (auto-refresh failed and no existing token) — aborting sync");
+    console.log("🛑 No valid token available — aborting sync");
     syncRunning = false;
     return;
   }
@@ -841,17 +629,15 @@ async function runSync(fullReset = false) {
     const savedProgress = loadProgress();
     const processedGroups = savedProgress.processedGroups || {};
     const { skuMap, titleToProductId, productSizes, productManagedByCosmo } = await getAllShopifySkus();
+
     let locationId = await getLocationId();
-    if (!locationId) {
-      console.log(`⚠️ locationId came back empty, retrying once...`);
-      await sleep(2000);
-      locationId = await getLocationId();
-    }
+    if (!locationId) { console.log(`⚠️ locationId came back empty, retrying once...`); await sleep(2000); locationId = await getLocationId(); }
     if (!locationId) {
       console.log(`🛑 CRITICAL: Could not get a valid locationId after retry. Every stock/price write in this sync depends on this — aborting this entire run rather than silently skipping all inventory updates.`);
       syncRunning = false;
       return;
     }
+
     let totalCreated = 0, totalUpdated = 0;
     const allowedLines = ["FRAG", "GIFT", "GSET", "SET", "COFF", "GFTS"];
 
@@ -876,14 +662,10 @@ async function runSync(fullReset = false) {
       saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems });
     }
 
-    // TARGETED TRACE — pull side: is this SKU even present in what we collected?
     for (const traceSku of TRACE_SKUS) {
       const found = allItems.find(i => i.Item === traceSku);
-      if (found) {
-        console.log(`🎯 TRACE ${traceSku}: FOUND in Cosmopolitan collection. Available=${found.Available}, raw item: ${JSON.stringify(found).slice(0, 300)}`);
-      } else {
-        console.log(`🎯 TRACE ${traceSku}: NOT FOUND anywhere in this cycle's ${allItems.length} collected items — this is a PULL-side problem (item missing from what we fetched, or a mismatched item code).`);
-      }
+      if (found) console.log(`🎯 TRACE ${traceSku}: FOUND in Cosmopolitan collection. Available=${found.Available}, raw item: ${JSON.stringify(found).slice(0, 300)}`);
+      else console.log(`🎯 TRACE ${traceSku}: NOT FOUND anywhere in this cycle's ${allItems.length} collected items`);
     }
 
     const existingSkuCount = Object.keys(skuMap).length;
@@ -897,16 +679,10 @@ async function runSync(fullReset = false) {
     let duplicateItemCodesInFeed = 0;
     for (const item of allItems) {
       const existing = cosmoData[item.Item];
-      if (existing) {
-        duplicateItemCodesInFeed++;
-        if ((item.Available || 0) > (existing.Available || 0)) cosmoData[item.Item] = item;
-      } else {
-        cosmoData[item.Item] = item;
-      }
+      if (existing) { duplicateItemCodesInFeed++; if ((item.Available || 0) > (existing.Available || 0)) cosmoData[item.Item] = item; }
+      else cosmoData[item.Item] = item;
     }
-    if (duplicateItemCodesInFeed > 0) {
-      console.log(`⚠️ Cosmopolitan's feed listed ${duplicateItemCodesInFeed} item code(s) more than once this cycle`);
-    }
+    if (duplicateItemCodesInFeed > 0) console.log(`⚠️ Cosmopolitan's feed listed ${duplicateItemCodesInFeed} item code(s) more than once this cycle`);
 
     const variantsByProduct = {};
     for (const sku of Object.keys(skuMap)) {
@@ -917,68 +693,36 @@ async function runSync(fullReset = false) {
 
     for (const productId of Object.keys(variantsByProduct)) {
       if (productManagedByCosmo[productId] === false) continue;
-
       const variants = variantsByProduct[productId];
-      const outVariants = [];
-      const inVariants = [];
+      const outVariants = [], inVariants = [];
       for (const v of variants) {
         const item = cosmoData[v.sku];
         const avail = item ? (item.Available || 0) : undefined;
-
-        // TARGETED TRACE — push side: what does the bulk pass decide for this SKU?
-        if (TRACE_SKUS.includes(v.sku)) {
-          console.log(`🎯 TRACE ${v.sku}: in bulk pass — found in cosmoData=${!!item}, Available=${item ? item.Available : "N/A"}, computed avail=${avail}, decision=${(avail === undefined || avail === 0) ? "OUT (will delete or leave deleted)" : "IN (will refresh stock/price)"}`);
-        }
-
+        if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: in bulk pass — found in cosmoData=${!!item}, Available=${item ? item.Available : "N/A"}, computed avail=${avail}, decision=${(avail === undefined || avail === 0) ? "OUT" : "IN"}`);
         if (avail === undefined || avail === 0) outVariants.push(v);
         else inVariants.push({ ...v, available: avail, net: item.Net, retail: item.Retail });
       }
-
       if (outVariants.length > 0 && inVariants.length > 0) {
-        const outSkus = outVariants.map(v => v.sku).join(", ");
-        console.log(`🔍 Mixed stock on product ${productId}: ${inVariants.length} size(s) in stock, ${outVariants.length} showing out (${outSkus})`);
+        console.log(`🔍 Mixed stock on product ${productId}: ${inVariants.length} size(s) in stock, ${outVariants.length} showing out (${outVariants.map(v => v.sku).join(", ")})`);
       }
-
       if (outVariants.length === variants.length) {
-        await setProductStatus(productId, "draft");
-        unpublished++;
-        await sleep(200);
+        await setProductStatus(productId, "draft"); unpublished++; await sleep(200);
       } else {
         for (const v of outVariants) {
-          if (TRACE_SKUS.includes(v.sku)) {
-            console.log(`🎯 TRACE ${v.sku}: about to DELETE this variant (product has other in-stock sizes)`);
-          }
-          await deleteVariant(productId, v.variantId);
-          variantsRemoved++;
-          await sleep(200);
+          if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: about to DELETE this variant`);
+          await deleteVariant(productId, v.variantId); variantsRemoved++; await sleep(200);
         }
-        if (inVariants.length > 0) {
-          await setProductStatus(productId, "active");
-          republished++;
-          await sleep(200);
-        }
+        if (inVariants.length > 0) { await setProductStatus(productId, "active"); republished++; await sleep(200); }
       }
-
       for (const v of inVariants) {
-        if (TRACE_SKUS.includes(v.sku)) {
-          console.log(`🎯 TRACE ${v.sku}: about to WRITE — variantId=${v.variantId}, inventoryItemId=${v.inventoryItemId}, target stock=${v.available}`);
-        }
+        if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: about to WRITE — variantId=${v.variantId}, inventoryItemId=${v.inventoryItemId}, target stock=${v.available}`);
         const freshDetail = await withRetry(() => fetchCosmoDetail(v.sku));
         let freshPrice, freshCompareAt;
-        if (freshDetail) {
-          freshPrice = calculatePrice(freshDetail.Net, freshDetail.Retail);
-          freshCompareAt = freshDetail.Retail ? parseFloat(freshDetail.Retail).toFixed(2) : null;
-        } else {
-          console.log(`⚠️ Could not fetch fresh price data for ${v.sku} — price left unchanged this cycle`);
-          freshPrice = null;
-          freshCompareAt = null;
-        }
+        if (freshDetail) { freshPrice = calculatePrice(freshDetail.Net, freshDetail.Retail); freshCompareAt = freshDetail.Retail ? parseFloat(freshDetail.Retail).toFixed(2) : null; }
+        else { console.log(`⚠️ Could not fetch fresh price data for ${v.sku} — price left unchanged this cycle`); freshPrice = null; freshCompareAt = null; }
         const writeResult = await updateInventory(v.variantId, v.inventoryItemId, v.available, locationId, freshPrice, freshCompareAt);
-        if (TRACE_SKUS.includes(v.sku)) {
-          console.log(`🎯 TRACE ${v.sku}: WRITE RESULT — ${JSON.stringify(writeResult)}`);
-        }
-        stockUpdated++;
-        await sleep(250);
+        if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: WRITE RESULT — ${JSON.stringify(writeResult)}`);
+        stockUpdated++; await sleep(250);
       }
     }
     console.log(`📉 Unpublished ${unpublished} fully out-of-stock products`);
@@ -987,37 +731,26 @@ async function runSync(fullReset = false) {
     console.log(`📦 Updated stock on ${stockUpdated} variants`);
     }
 
-    const groups = savedProgress.groups && Object.keys(savedProgress.groups).length
-      ? savedProgress.groups : {};
+    const groups = savedProgress.groups && Object.keys(savedProgress.groups).length ? savedProgress.groups : {};
     const startIndex = savedProgress.lastItemIndex || 0;
     const seenProductLines = new Set();
 
     console.log(`🔍 Phase 1: Fetching all product details and grouping (resuming from item ${startIndex})...`);
     for (let i = startIndex; i < allItems.length; i++) {
       const item = allItems[i];
-      if (skuMap[item.Item]) { continue; }
-
+      if (skuMap[item.Item]) continue;
       const detail = await withRetry(() => fetchCosmoDetail(item.Item));
-      if (!detail) {
-        console.log(`⚠️ Could not fetch details for new item ${item.Item} after retries — this product will not be created this cycle`);
-        continue;
-      }
+      if (!detail) { console.log(`⚠️ Could not fetch details for new item ${item.Item} after retries`); continue; }
       if (detail.ProductLine) seenProductLines.add(detail.ProductLine);
       if (!allowedLines.includes(detail.ProductLine)) continue;
-
       const key = buildGroupKey(detail);
       if (!groups[key]) groups[key] = [];
       groups[key].push(detail);
-
-      if (i % 25 === 0) {
-        console.log(`📋 ${i+1}/${allItems.length} items processed, ${Object.keys(groups).length} groups so far`);
-        saveProgress({ processedGroups, groups, lastItemIndex: i + 1, allItems });
-      }
+      if (i % 25 === 0) { console.log(`📋 ${i+1}/${allItems.length} items processed, ${Object.keys(groups).length} groups so far`); saveProgress({ processedGroups, groups, lastItemIndex: i + 1, allItems }); }
       await sleep(250);
     }
 
     console.log(`📦 Phase 1 complete! ${Object.keys(groups).length} unique fragrances found`);
-    console.log(`📋 Product lines: ${Array.from(seenProductLines).join(", ")}`);
     saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems: null });
 
     console.log("🛍️ Phase 2: Creating grouped products in Shopify...");
@@ -1026,7 +759,6 @@ async function runSync(fullReset = false) {
       const key = groupKeys[g];
       const groupDetails = groups[key];
       if (processedGroups[key]) continue;
-
       const skuMatch = groupDetails.find(d => skuMap[d.Item]);
       const computedTitle = buildProductTitle(groupDetails);
       const titleMatchProductId = titleToProductId[computedTitle];
@@ -1038,18 +770,14 @@ async function runSync(fullReset = false) {
         const bySizeToAdd = {};
         for (const detail of newItems) {
           const size = extractSize(detail.Desc || "") || "One Size";
-          if (!bySizeToAdd[size] || (detail.Available || 0) > (bySizeToAdd[size].Available || 0)) {
-            bySizeToAdd[size] = detail;
-          }
+          if (!bySizeToAdd[size] || (detail.Available || 0) > (bySizeToAdd[size].Available || 0)) bySizeToAdd[size] = detail;
         }
         for (const detail of Object.values(bySizeToAdd)) {
           const size = extractSize(detail.Desc || "") || "One Size";
           const existingSizeEntry = productSizes[existingProductId] && productSizes[existingProductId][size];
           if (existingSizeEntry) {
             const refreshed = await refreshExistingVariant(existingSizeEntry.variantId, existingSizeEntry.inventoryItemId, detail, locationId, existingProductId);
-            if (refreshed) {
-              skuMap[refreshed.sku] = { productId: existingProductId, variantId: refreshed.variantId, inventoryItemId: refreshed.inventoryItemId };
-            }
+            if (refreshed) skuMap[refreshed.sku] = { productId: existingProductId, variantId: refreshed.variantId, inventoryItemId: refreshed.inventoryItemId };
           } else {
             const newVariant = await addVariantToProduct(existingProductId, detail);
             if (newVariant && newVariant.sku) {
@@ -1060,10 +788,7 @@ async function runSync(fullReset = false) {
           }
           await sleep(300);
         }
-        if (Object.values(bySizeToAdd).length > 0) {
-          await setProductStatus(existingProductId, "active");
-          await sleep(200);
-        }
+        if (Object.values(bySizeToAdd).length > 0) { await setProductStatus(existingProductId, "active"); await sleep(200); }
         processedGroups[key] = existingProductId;
         totalUpdated++;
       } else {
@@ -1071,28 +796,19 @@ async function runSync(fullReset = false) {
         if (created) {
           processedGroups[key] = created.id;
           titleToProductId[created.title] = created.id;
-          for (const v of created.variants || []) {
-            if (v.sku) skuMap[v.sku] = { productId: created.id, variantId: v.id, inventoryItemId: v.inventory_item_id };
-          }
+          for (const v of created.variants || []) if (v.sku) skuMap[v.sku] = { productId: created.id, variantId: v.id, inventoryItemId: v.inventory_item_id };
           totalCreated++;
         }
         await sleep(600);
       }
-
-      if (g % 25 === 0) {
-        saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems: null });
-        console.log(`💾 Progress: ${g+1}/${groupKeys.length} groups, ${totalCreated} created`);
-      }
+      if (g % 25 === 0) { saveProgress({ processedGroups, groups: {}, lastItemIndex: 0, allItems: null }); console.log(`💾 Progress: ${g+1}/${groupKeys.length} groups, ${totalCreated} created`); }
     }
 
-    console.log(`\n📋 Product lines seen: ${Array.from(seenProductLines).join(", ")}`);
     clearProgress();
     console.log(`\n📊 Sync complete! Created: ${totalCreated}, Updated: ${totalUpdated}`);
-
     await processOrders();
     await syncTracking();
     console.log("🌸 All done!");
-
   } catch (err) {
     console.error("❌ Sync error:", err.message);
     console.error(err.stack);
@@ -1107,13 +823,8 @@ const server = http.createServer(async (req, res) => {
 
   if (path === "/") {
     res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(`<h1>🌸 Bloom Fragrances USA</h1>
-      <p>Status: ${SHOPIFY_TOKEN ? "✅ Connected" : "⚠️ Not connected"}</p>
-      <p>Sync running: ${syncRunning ? "Yes ⏳" : "No"}</p>
-      ${!SHOPIFY_TOKEN
-        ? '<a href="/install"><button>Connect to Shopify</button></a>'
-        : '<a href="/sync"><button>Sync Now</button></a> &nbsp; <a href="/fullsync"><button>Full Reset Sync</button></a>'
-      }`);
+    res.end(`<h1>🌸 Bloom Fragrances USA</h1><p>Sync running: ${syncRunning ? "Yes ⏳" : "No"}</p>
+      <a href="/sync"><button>Sync Now</button></a> &nbsp; <a href="/fullsync"><button>Full Reset Sync</button></a>`);
   }
   else if (path === "/install") {
     const host = `https://${req.headers.host}`;
@@ -1125,36 +836,15 @@ const server = http.createServer(async (req, res) => {
     if (!code) { res.writeHead(400); res.end("Missing code"); return; }
     try {
       SHOPIFY_TOKEN = await exchangeCodeForToken(code, `https://${req.headers.host}`);
-      console.log("✅ OAuth complete!");
-      console.log("🔑 SAVE THIS TOKEN TO RENDER ENV: " + SHOPIFY_TOKEN);
       res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(`<h1>✅ Connected!</h1><p>Sync starting...</p><a href="/">Back</a>`);
+      res.end(`<h1>✅ Connected!</h1>`);
       runSync(true);
-    } catch (err) {
-      res.writeHead(500);
-      res.end("OAuth failed: " + err.message);
-    }
+    } catch (err) { res.writeHead(500); res.end("OAuth failed: " + err.message); }
   }
-  else if (path === "/sync") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("Sync started! Check logs.");
-    runSync();
-  }
-  else if (path === "/fullsync") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("Full reset sync started! Check logs.");
-    runSync(true);
-  }
-  else if (path === "/cleanup-duplicates") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("Duplicate cleanup started! Check logs.");
-    cleanupDuplicates();
-  }
-  else if (path === "/fix-variant-images") {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("Variant image fix started! Check logs.");
-    fixVariantImages();
-  }
+  else if (path === "/sync") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Sync started! Check logs."); runSync(); }
+  else if (path === "/fullsync") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Full reset sync started! Check logs."); runSync(true); }
+  else if (path === "/cleanup-duplicates") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Duplicate cleanup started! Check logs."); cleanupDuplicates(); }
+  else if (path === "/fix-variant-images") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Variant image fix started! Check logs."); fixVariantImages(); }
   else { res.writeHead(404); res.end("Not found"); }
 });
 
