@@ -15,7 +15,8 @@ const PORT = process.env.PORT || 3000;
 const PROGRESS_FILE = "/tmp/sync_progress.json";
 
 let SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
-let syncRunning = false;
+let operationRunning = false; // shared lock — sync, cleanup, and image-fix can never run at the same time
+let operationName = null;
 
 const TRACE_SKUS = ["LRBES3-A", "LRBES17-A"];
 
@@ -405,7 +406,10 @@ async function setProductStatus(productId, status) {
 
 // ─── ONE-TIME FIX: LINK VARIANT IMAGES ON EXISTING PRODUCTS ────────────────
 async function fixVariantImages() {
+  if (operationRunning) { console.log(`⚠️ Cannot start image fix — ${operationName} is currently running`); return; }
+  operationRunning = true; operationName = "fix-variant-images";
   console.log("🖼️ Variant image fix starting...");
+  try {
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,tags,images,variants";
   let allProducts = [];
   while (true) {
@@ -482,11 +486,17 @@ async function fixVariantImages() {
 
   console.log(`🖼️ Variant image fix complete: ${productsFixed} products fixed, ${variantsLinked} variants linked, ${imagesUploaded} images uploaded, ${skippedSameImage} products skipped (same image for all sizes), ${errors} errors`);
   return { productsFixed, variantsLinked, imagesUploaded, skippedSameImage, errors };
+  } finally {
+    operationRunning = false; operationName = null;
+  }
 }
 
 // ─── ONE-TIME DUPLICATE CLEANUP ────────────────────────────────────────────
 async function cleanupDuplicates() {
+  if (operationRunning) { console.log(`⚠️ Cannot start cleanup — ${operationName} is currently running`); return; }
+  operationRunning = true; operationName = "cleanup-duplicates";
   console.log("🧹 Duplicate cleanup starting...");
+  try {
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,status,variants,tags";
   let allProducts = [];
   while (true) {
@@ -543,6 +553,9 @@ async function cleanupDuplicates() {
   }
   console.log(`🧹 Cleanup complete: ${mergedGroups} duplicate title groups merged, ${variantsMoved} sizes moved, ${sizesSkippedDuplicate} redundant sizes skipped, ${productsDeleted} duplicate products deleted`);
   return { mergedGroups, variantsMoved, sizesSkippedDuplicate, productsDeleted };
+  } finally {
+    operationRunning = false; operationName = null;
+  }
 }
 
 // ─── ORDERS ──────────────────────────────────────────────────────────────────
@@ -613,14 +626,14 @@ async function syncTracking() {
 
 // ─── MAIN SYNC ────────────────────────────────────────────────────────────────
 async function runSync(fullReset = false) {
-  if (syncRunning) { console.log("⚠️ Sync already running"); return; }
-  syncRunning = true;
+  if (operationRunning) { console.log(`⚠️ Cannot start sync — ${operationName} is currently running`); return; }
+  operationRunning = true; operationName = "sync";
   console.log("🌸 Bloom Fragrances USA - Sync starting...", new Date().toISOString());
 
   const refreshed = await refreshShopifyToken();
   if (!refreshed && !SHOPIFY_TOKEN) {
     console.log("🛑 No valid token available — aborting sync");
-    syncRunning = false;
+    operationRunning = false; operationName = null;
     return;
   }
 
@@ -634,7 +647,7 @@ async function runSync(fullReset = false) {
     if (!locationId) { console.log(`⚠️ locationId came back empty, retrying once...`); await sleep(2000); locationId = await getLocationId(); }
     if (!locationId) {
       console.log(`🛑 CRITICAL: Could not get a valid locationId after retry. Every stock/price write in this sync depends on this — aborting this entire run rather than silently skipping all inventory updates.`);
-      syncRunning = false;
+      operationRunning = false; operationName = null;
       return;
     }
 
@@ -813,7 +826,7 @@ async function runSync(fullReset = false) {
     console.error("❌ Sync error:", err.message);
     console.error(err.stack);
   }
-  syncRunning = false;
+  operationRunning = false; operationName = null;
 }
 
 // ─── WEB SERVER ──────────────────────────────────────────────────────────────
@@ -823,7 +836,7 @@ const server = http.createServer(async (req, res) => {
 
   if (path === "/") {
     res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(`<h1>🌸 Bloom Fragrances USA</h1><p>Sync running: ${syncRunning ? "Yes ⏳" : "No"}</p>
+    res.end(`<h1>🌸 Bloom Fragrances USA</h1><p>Busy: ${operationRunning ? "Yes ⏳ (" + operationName + ")" : "No"}</p>
       <a href="/sync"><button>Sync Now</button></a> &nbsp; <a href="/fullsync"><button>Full Reset Sync</button></a>`);
   }
   else if (path === "/install") {
@@ -843,8 +856,14 @@ const server = http.createServer(async (req, res) => {
   }
   else if (path === "/sync") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Sync started! Check logs."); runSync(); }
   else if (path === "/fullsync") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Full reset sync started! Check logs."); runSync(true); }
-  else if (path === "/cleanup-duplicates") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Duplicate cleanup started! Check logs."); cleanupDuplicates(); }
-  else if (path === "/fix-variant-images") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Variant image fix started! Check logs."); fixVariantImages(); }
+  else if (path === "/cleanup-duplicates") {
+    if (operationRunning) { res.writeHead(200, { "Content-Type": "text/plain" }); res.end(`Cannot start — ${operationName} is currently running. Try again once it finishes.`); }
+    else { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Duplicate cleanup started! Check logs."); cleanupDuplicates(); }
+  }
+  else if (path === "/fix-variant-images") {
+    if (operationRunning) { res.writeHead(200, { "Content-Type": "text/plain" }); res.end(`Cannot start — ${operationName} is currently running. Try again once it finishes.`); }
+    else { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Variant image fix started! Check logs."); fixVariantImages(); }
+  }
   else { res.writeHead(404); res.end("Not found"); }
 });
 
