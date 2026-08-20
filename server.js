@@ -870,5 +870,5 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`🌸 Server running on port ${PORT}`);
   setInterval(() => runSync(), 45 * 60 * 1000);
-  if (SHOPIFY_TOKEN) setTimeout(() => runSync(), 5000);
+  setTimeout(() => runSync(), 5000); // auto-refreshes its own token now, no need to gate on the old static var
 });
