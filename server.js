@@ -62,6 +62,17 @@ function saveProgress(p) { try { fs.writeFileSync(PROGRESS_FILE, JSON.stringify(
 function clearProgress() { try { if (fs.existsSync(PROGRESS_FILE)) fs.unlinkSync(PROGRESS_FILE); } catch(e) {} }
 
 // ─── PRICING ────────────────────────────────────────────────────────────────
+// Cosmopolitan sometimes sends a URL to their own "no image available"
+// placeholder graphic instead of leaving the field empty. Treat these exactly
+// like no image was provided, rather than uploading a "NO IMAGE" graphic.
+function getRealImageUrl(item) {
+  if (!item || !item.ImageURL) return null;
+  const url = item.ImageURL.trim();
+  if (!url) return null;
+  if (/no[\-_]?image/i.test(url)) return null;
+  return url.replace("http://", "https://");
+}
+
 function calculatePrice(wholesale, retail) {
   const net = parseFloat(wholesale || 0);
   const ret = parseFloat(retail || 0);
@@ -208,8 +219,8 @@ async function fetchCosmoDetail(itemCode) {
 
 // ─── SHOPIFY API ─────────────────────────────────────────────────────────────
 async function getAllShopifySkus() {
-  let skuMap = {}, titleGroups = {}, productSizes = {}, productManagedByCosmo = {};
-  let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,status,variants,tags";
+  let skuMap = {}, titleGroups = {}, productSizes = {}, productManagedByCosmo = {}, productHasRealImage = {};
+  let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,status,variants,tags,images";
   while (true) {
     const res = await request({ hostname: SHOPIFY_STORE, path, method: "GET",
       headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
@@ -218,6 +229,8 @@ async function getAllShopifySkus() {
       if (!productSizes[p.id]) productSizes[p.id] = {};
       const tags = (p.tags || "").split(",").map(t => t.trim().toLowerCase());
       productManagedByCosmo[p.id] = tags.includes("fragrance");
+      const realImages = (p.images || []).filter(img => !/no[\-_]?image/i.test(img.src || ""));
+      productHasRealImage[p.id] = realImages.length > 0;
       for (const v of p.variants || []) {
         if (v.sku) skuMap[v.sku] = { productId: p.id, variantId: v.id, inventoryItemId: v.inventory_item_id };
         if (v.option1) productSizes[p.id][v.option1] = { variantId: v.id, sku: v.sku, inventoryItemId: v.inventory_item_id };
@@ -239,7 +252,7 @@ async function getAllShopifySkus() {
   }
   if (duplicateTitlesFound > 0) console.log(`⚠️ Total duplicate product titles: ${duplicateTitlesFound} — visit /cleanup-duplicates`);
   console.log(`🛍️ Existing Shopify SKUs: ${Object.keys(skuMap).length}`);
-  return { skuMap, titleToProductId, productSizes, productManagedByCosmo };
+  return { skuMap, titleToProductId, productSizes, productManagedByCosmo, productHasRealImage };
 }
 async function getLocationId() {
   const res = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/locations.json", method: "GET",
@@ -267,7 +280,7 @@ async function createShopifyProduct(groupDetails) {
     const sizeB = parseFloat((b.Desc || "").match(/(\d+\.?\d*)\s*OZ/i)?.[1] || 99);
     return sizeA - sizeB;
   });
-  const uniqueImageUrls = [...new Set(sortedDetails.map(d => d.ImageURL?.trim().replace("http://", "https://")).filter(Boolean))];
+  const uniqueImageUrls = [...new Set(sortedDetails.map(d => getRealImageUrl(d)).filter(Boolean))];
   const variants = sortedDetails.map(detail => {
     const size = extractSize(detail.Desc || "") || "One Size";
     return { option1: size, sku: detail.Item, price: calculatePrice(detail.Net, detail.Retail),
@@ -289,7 +302,7 @@ async function createShopifyProduct(groupDetails) {
     const createdImages = res.body.product.images || [];
     for (const createdVariant of res.body.product.variants || []) {
       const originalDetail = sortedDetails.find(d => d.Item === createdVariant.sku);
-      const detailImageUrl = originalDetail?.ImageURL?.trim().replace("http://", "https://");
+      const detailImageUrl = getRealImageUrl(originalDetail);
       const matchingImage = createdImages.find(img => img.src === detailImageUrl);
       if (matchingImage) {
         const linkRes = await request(
@@ -408,7 +421,7 @@ async function setProductStatus(productId, status) {
 async function fixVariantImages() {
   if (operationRunning) { console.log(`⚠️ Cannot start image fix — ${operationName} is currently running`); return; }
   operationRunning = true; operationName = "fix-variant-images";
-  console.log("🖼️ Variant image fix starting...");
+  console.log("🖼️ Image freshness check starting...");
   try {
   let path = "/admin/api/2024-01/products.json?limit=250&fields=id,title,tags,images,variants";
   let allProducts = [];
@@ -420,72 +433,97 @@ async function fixVariantImages() {
     if (link.includes('rel="next"')) { const m = link.match(/<([^>]+)>;\s*rel="next"/); if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break; } else break;
   }
   console.log(`🖼️ Scanned ${allProducts.length} total products`);
-  const multiVariantFragranceProducts = allProducts.filter(p => {
+  // Check EVERY fragrance product — single-size products can also have a
+  // stale/wrong photo, not just multi-size ones needing per-size differentiation
+  const fragranceProducts = allProducts.filter(p => {
     const tags = (p.tags || "").split(",").map(t => t.trim().toLowerCase());
-    return tags.includes("fragrance") && (p.variants || []).length > 1;
+    return tags.includes("fragrance") && (p.variants || []).length > 0;
   });
-  console.log(`🖼️ ${multiVariantFragranceProducts.length} multi-size fragrance products to check`);
+  console.log(`🖼️ ${fragranceProducts.length} fragrance products to check`);
 
-  let productsFixed = 0, variantsLinked = 0, imagesUploaded = 0, skippedSameImage = 0, errors = 0;
+  let productsFixed = 0, variantsLinked = 0, imagesUploaded = 0, skippedAlreadyCorrect = 0, errors = 0;
 
-  for (let i = 0; i < multiVariantFragranceProducts.length; i++) {
-    const product = multiVariantFragranceProducts[i];
+  for (let i = 0; i < fragranceProducts.length; i++) {
+    const product = fragranceProducts[i];
 
     if (i % 10 === 0) {
-      console.log(`🖼️ Progress: ${i}/${multiVariantFragranceProducts.length} products checked — ${productsFixed} fixed so far, ${skippedSameImage} skipped (same image)`);
+      console.log(`🖼️ Progress: ${i}/${fragranceProducts.length} products checked — ${productsFixed} fixed so far, ${skippedAlreadyCorrect} already correct`);
     }
 
     const skuToImageUrl = {};
-    const seenUrls = new Set();
     for (const v of product.variants) {
       if (!v.sku) continue;
       const detail = await withRetry(() => fetchCosmoDetail(v.sku));
-      if (detail && detail.ImageURL) {
-        const imgUrl = detail.ImageURL.trim().replace("http://", "https://");
-        skuToImageUrl[v.sku] = imgUrl;
-        seenUrls.add(imgUrl);
+      const realUrl = getRealImageUrl(detail);
+      if (realUrl) {
+        skuToImageUrl[v.sku] = realUrl;
       }
       await sleep(200);
     }
 
-    if (seenUrls.size <= 1) { skippedSameImage++; continue; }
+    const neededUrls = new Set(Object.values(skuToImageUrl));
+    if (neededUrls.size === 0) { skippedAlreadyCorrect++; continue; } // Cosmo gave us nothing to work with this pass
 
     const existingImagesBySrc = {};
     for (const img of product.images || []) existingImagesBySrc[img.src] = img;
 
-    for (const imgUrl of seenUrls) {
+    let anythingChanged = false;
+
+    // Upload any needed image that isn't already on the product
+    for (const imgUrl of neededUrls) {
       if (!existingImagesBySrc[imgUrl]) {
         const uploadRes = await request(
           { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${product.id}/images.json`, method: "POST",
             headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
           { image: { src: imgUrl } }
         );
-        if (uploadRes.status === 200 || uploadRes.status === 201) { existingImagesBySrc[imgUrl] = uploadRes.body.image; imagesUploaded++; }
+        if (uploadRes.status === 200 || uploadRes.status === 201) { existingImagesBySrc[imgUrl] = uploadRes.body.image; imagesUploaded++; anythingChanged = true; }
         else { console.log(`⚠️ Failed to upload image for product ${product.id}: status ${uploadRes.status}`); errors++; }
         await sleep(300);
       }
     }
 
-    let anyLinked = false;
+    // Link (or re-link) each variant to its CURRENT correct image — this covers
+    // both the "different photo per size" case and the "single photo changed" case
     for (const v of product.variants) {
       const imgUrl = skuToImageUrl[v.sku];
       const image = imgUrl ? existingImagesBySrc[imgUrl] : null;
+
+      // Clean up: if this variant is currently linked to a "no image" placeholder
+      // graphic from before this fix existed, remove that bad link. Better to
+      // show no image at all than a broken "NO IMAGE" placeholder photo.
+      const currentImage = (product.images || []).find(img => img.id === v.image_id);
+      const currentIsPlaceholder = currentImage && /no[\-_]?image/i.test(currentImage.src || "");
+      if (currentIsPlaceholder && !image) {
+        const clearRes = await request(
+          { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${v.id}.json`, method: "PUT",
+            headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+          { variant: { id: v.id, image_id: null } }
+        );
+        if (clearRes.status === 200) { variantsLinked++; anythingChanged = true; }
+        else { console.log(`⚠️ Failed to clear placeholder image for variant ${v.sku}: status ${clearRes.status}`); errors++; }
+        await sleep(250);
+        continue;
+      }
+
       if (image && v.image_id !== image.id) {
         const linkRes = await request(
           { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${v.id}.json`, method: "PUT",
             headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
           { variant: { id: v.id, image_id: image.id } }
         );
-        if (linkRes.status === 200) { variantsLinked++; anyLinked = true; }
+        if (linkRes.status === 200) { variantsLinked++; anythingChanged = true; }
         else { console.log(`⚠️ Failed to link image for variant ${v.sku}: status ${linkRes.status}`); errors++; }
         await sleep(250);
       }
     }
-    if (anyLinked) productsFixed++;
+
+    if (anythingChanged) productsFixed++;
+    else skippedAlreadyCorrect++;
   }
 
-  console.log(`🖼️ Variant image fix complete: ${productsFixed} products fixed, ${variantsLinked} variants linked, ${imagesUploaded} images uploaded, ${skippedSameImage} products skipped (same image for all sizes), ${errors} errors`);
-  return { productsFixed, variantsLinked, imagesUploaded, skippedSameImage, errors };
+  console.log(`🖼️ Image freshness check complete: ${productsFixed} products fixed, ${variantsLinked} variants linked, ${imagesUploaded} images uploaded, ${skippedAlreadyCorrect} already correct, ${errors} errors`);
+  return { productsFixed, variantsLinked, imagesUploaded, skippedAlreadyCorrect, errors };
   } finally {
     operationRunning = false; operationName = null;
   }
@@ -641,7 +679,7 @@ async function runSync(fullReset = false) {
     if (fullReset) clearProgress();
     const savedProgress = loadProgress();
     const processedGroups = savedProgress.processedGroups || {};
-    const { skuMap, titleToProductId, productSizes, productManagedByCosmo } = await getAllShopifySkus();
+    const { skuMap, titleToProductId, productSizes, productManagedByCosmo, productHasRealImage } = await getAllShopifySkus();
 
     let locationId = await getLocationId();
     if (!locationId) { console.log(`⚠️ locationId came back empty, retrying once...`); await sleep(2000); locationId = await getLocationId(); }
@@ -735,6 +773,28 @@ async function runSync(fullReset = false) {
         else { console.log(`⚠️ Could not fetch fresh price data for ${v.sku} — price left unchanged this cycle`); freshPrice = null; freshCompareAt = null; }
         const writeResult = await updateInventory(v.variantId, v.inventoryItemId, v.available, locationId, freshPrice, freshCompareAt);
         if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: WRITE RESULT — ${JSON.stringify(writeResult)}`);
+
+        // Catch-up: if this product currently has no real photo, check if
+        // Cosmopolitan has since added one — reuses freshDetail already fetched
+        // above, so this costs no extra API calls except when actually needed
+        if (productHasRealImage[productId] === false) {
+          const realUrl = getRealImageUrl(freshDetail);
+          if (realUrl) {
+            const uploadRes = await request(
+              { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/products/${productId}/images.json`, method: "POST",
+                headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
+              { image: { src: realUrl } }
+            );
+            if (uploadRes.status === 200 || uploadRes.status === 201) {
+              console.log(`🖼️ Caught up missing image for product ${productId} (${v.sku})`);
+              productHasRealImage[productId] = true; // don't re-upload for sibling variants this same cycle
+            } else {
+              console.log(`⚠️ Failed to catch up image for product ${productId}: status ${uploadRes.status}`);
+            }
+            await sleep(300);
+          }
+        }
+
         stockUpdated++; await sleep(250);
       }
     }
