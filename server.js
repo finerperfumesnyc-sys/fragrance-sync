@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 const PROGRESS_FILE = "/tmp/sync_progress.json";
 
 let SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
-let operationRunning = false; // shared lock — sync, cleanup, and image-fix can never run at the same time
+let operationRunning = false;
 let operationName = null;
 
 const TRACE_SKUS = ["LRBES3-A", "LRBES17-A"];
@@ -61,18 +61,18 @@ function loadProgress() {
 function saveProgress(p) { try { fs.writeFileSync(PROGRESS_FILE, JSON.stringify(p)); } catch(e) {} }
 function clearProgress() { try { if (fs.existsSync(PROGRESS_FILE)) fs.unlinkSync(PROGRESS_FILE); } catch(e) {} }
 
-// ─── PRICING ────────────────────────────────────────────────────────────────
 // Cosmopolitan sometimes sends a URL to their own "no image available"
 // placeholder graphic instead of leaving the field empty. Treat these exactly
 // like no image was provided, rather than uploading a "NO IMAGE" graphic.
 function getRealImageUrl(item) {
   if (!item || !item.ImageURL) return null;
-  const url = item.ImageURL.trim();
-  if (!url) return null;
-  if (/no[\-_]?image/i.test(url)) return null;
-  return url.replace("http://", "https://");
+  const imgUrl = item.ImageURL.trim();
+  if (!imgUrl) return null;
+  if (/no[\-_]?image/i.test(imgUrl)) return null;
+  return imgUrl.replace("http://", "https://");
 }
 
+// ─── PRICING ────────────────────────────────────────────────────────────────
 function calculatePrice(wholesale, retail) {
   const net = parseFloat(wholesale || 0);
   const ret = parseFloat(retail || 0);
@@ -417,7 +417,7 @@ async function setProductStatus(productId, status) {
   return res.status === 200;
 }
 
-// ─── ONE-TIME FIX: LINK VARIANT IMAGES ON EXISTING PRODUCTS ────────────────
+// ─── ONE-TIME FIX: IMAGE FRESHNESS CHECK ON EXISTING PRODUCTS ──────────────
 async function fixVariantImages() {
   if (operationRunning) { console.log(`⚠️ Cannot start image fix — ${operationName} is currently running`); return; }
   operationRunning = true; operationName = "fix-variant-images";
@@ -433,8 +433,6 @@ async function fixVariantImages() {
     if (link.includes('rel="next"')) { const m = link.match(/<([^>]+)>;\s*rel="next"/); if (m) { path = m[1].replace(`https://${SHOPIFY_STORE}`, ""); await sleep(500); } else break; } else break;
   }
   console.log(`🖼️ Scanned ${allProducts.length} total products`);
-  // Check EVERY fragrance product — single-size products can also have a
-  // stale/wrong photo, not just multi-size ones needing per-size differentiation
   const fragranceProducts = allProducts.filter(p => {
     const tags = (p.tags || "").split(",").map(t => t.trim().toLowerCase());
     return tags.includes("fragrance") && (p.variants || []).length > 0;
@@ -445,31 +443,24 @@ async function fixVariantImages() {
 
   for (let i = 0; i < fragranceProducts.length; i++) {
     const product = fragranceProducts[i];
-
-    if (i % 10 === 0) {
-      console.log(`🖼️ Progress: ${i}/${fragranceProducts.length} products checked — ${productsFixed} fixed so far, ${skippedAlreadyCorrect} already correct`);
-    }
+    if (i % 10 === 0) console.log(`🖼️ Progress: ${i}/${fragranceProducts.length} products checked — ${productsFixed} fixed so far, ${skippedAlreadyCorrect} already correct`);
 
     const skuToImageUrl = {};
     for (const v of product.variants) {
       if (!v.sku) continue;
       const detail = await withRetry(() => fetchCosmoDetail(v.sku));
       const realUrl = getRealImageUrl(detail);
-      if (realUrl) {
-        skuToImageUrl[v.sku] = realUrl;
-      }
+      if (realUrl) skuToImageUrl[v.sku] = realUrl;
       await sleep(200);
     }
 
     const neededUrls = new Set(Object.values(skuToImageUrl));
-    if (neededUrls.size === 0) { skippedAlreadyCorrect++; continue; } // Cosmo gave us nothing to work with this pass
+    if (neededUrls.size === 0) { skippedAlreadyCorrect++; continue; }
 
     const existingImagesBySrc = {};
     for (const img of product.images || []) existingImagesBySrc[img.src] = img;
 
     let anythingChanged = false;
-
-    // Upload any needed image that isn't already on the product
     for (const imgUrl of neededUrls) {
       if (!existingImagesBySrc[imgUrl]) {
         const uploadRes = await request(
@@ -483,15 +474,9 @@ async function fixVariantImages() {
       }
     }
 
-    // Link (or re-link) each variant to its CURRENT correct image — this covers
-    // both the "different photo per size" case and the "single photo changed" case
     for (const v of product.variants) {
       const imgUrl = skuToImageUrl[v.sku];
       const image = imgUrl ? existingImagesBySrc[imgUrl] : null;
-
-      // Clean up: if this variant is currently linked to a "no image" placeholder
-      // graphic from before this fix existed, remove that bad link. Better to
-      // show no image at all than a broken "NO IMAGE" placeholder photo.
       const currentImage = (product.images || []).find(img => img.id === v.image_id);
       const currentIsPlaceholder = currentImage && /no[\-_]?image/i.test(currentImage.src || "");
       if (currentIsPlaceholder && !image) {
@@ -505,7 +490,6 @@ async function fixVariantImages() {
         await sleep(250);
         continue;
       }
-
       if (image && v.image_id !== image.id) {
         const linkRes = await request(
           { hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/variants/${v.id}.json`, method: "PUT",
@@ -517,9 +501,7 @@ async function fixVariantImages() {
         await sleep(250);
       }
     }
-
-    if (anythingChanged) productsFixed++;
-    else skippedAlreadyCorrect++;
+    if (anythingChanged) productsFixed++; else skippedAlreadyCorrect++;
   }
 
   console.log(`🖼️ Image freshness check complete: ${productsFixed} products fixed, ${variantsLinked} variants linked, ${imagesUploaded} images uploaded, ${skippedAlreadyCorrect} already correct, ${errors} errors`);
@@ -606,21 +588,43 @@ async function processOrders() {
     if ((order.tags || "").includes("cosmo-submitted")) continue;
     const shipping = order.shipping_address;
     if (!shipping) continue;
+
+    // CRITICAL FIX: NET must be the WHOLESALE cost, not what the customer paid.
+    // Fetch each item's real current wholesale price directly from Cosmopolitan
+    // at order time, instead of using the customer's Shopify price.
+    const lines = [];
+    for (const item of order.line_items) {
+      const detail = await withRetry(() => fetchCosmoDetail(item.sku));
+      let netPrice;
+      if (detail && detail.Net) {
+        netPrice = parseFloat(detail.Net).toFixed(2);
+      } else {
+        console.log(`⚠️ Could not fetch wholesale price for ${item.sku} on order BLOOM-${order.order_number} — falling back to customer price, VERIFY THIS ORDER MANUALLY`);
+        netPrice = parseFloat(item.price || 0).toFixed(2);
+      }
+      lines.push({
+        SKU: item.sku, QTY: item.quantity, NET: netPrice,
+        EndPrice: shipping.country_code !== "US" ? parseFloat(item.price).toFixed(2) : undefined
+      });
+      await sleep(200);
+    }
+
     const suborder = { Suborder: `BLOOM-${order.order_number}`,
       ShipTo: { Name: `${shipping.first_name} ${shipping.last_name}`.trim(), Line1: shipping.address1, Line2: shipping.address2 || undefined,
         City: shipping.city, State: shipping.province_code, Zip: shipping.zip, Country: shipping.country_code,
         Phone: shipping.phone || undefined, Email: order.email || undefined, Residence: true },
-      Lines: order.line_items.map(item => ({ SKU: item.sku, QTY: item.quantity, NET: parseFloat(item.price || 0).toFixed(2),
-        EndPrice: shipping.country_code !== "US" ? parseFloat(item.price).toFixed(2) : undefined })) };
+      Lines: lines };
     const subRes = await request(
       { hostname: "api.cosmopolitanusa.com", path: "/v1/suborders", method: "POST",
         headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } }, suborder);
     if (subRes.status === 201 || subRes.status === 200) {
       submitted++;
-      console.log(`✅ Submitted order BLOOM-${order.order_number}`);
+      console.log(`✅ Submitted order BLOOM-${order.order_number} (NET=wholesale cost, verified per-item)`);
       await request({ hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}.json`, method: "PUT",
         headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
         { order: { id: order.id, tags: ((order.tags || "") + ",cosmo-submitted").replace(/^,/, "") } });
+    } else {
+      console.log(`⚠️ Failed to submit order BLOOM-${order.order_number}: status ${subRes.status} — ${JSON.stringify(subRes.body).slice(0, 200)}`);
     }
     await sleep(300);
   }
@@ -684,7 +688,7 @@ async function runSync(fullReset = false) {
     let locationId = await getLocationId();
     if (!locationId) { console.log(`⚠️ locationId came back empty, retrying once...`); await sleep(2000); locationId = await getLocationId(); }
     if (!locationId) {
-      console.log(`🛑 CRITICAL: Could not get a valid locationId after retry. Every stock/price write in this sync depends on this — aborting this entire run rather than silently skipping all inventory updates.`);
+      console.log(`🛑 CRITICAL: Could not get a valid locationId after retry. Aborting this entire run.`);
       operationRunning = false; operationName = null;
       return;
     }
@@ -715,8 +719,8 @@ async function runSync(fullReset = false) {
 
     for (const traceSku of TRACE_SKUS) {
       const found = allItems.find(i => i.Item === traceSku);
-      if (found) console.log(`🎯 TRACE ${traceSku}: FOUND in Cosmopolitan collection. Available=${found.Available}, raw item: ${JSON.stringify(found).slice(0, 300)}`);
-      else console.log(`🎯 TRACE ${traceSku}: NOT FOUND anywhere in this cycle's ${allItems.length} collected items`);
+      if (found) console.log(`🎯 TRACE ${traceSku}: FOUND. Available=${found.Available}`);
+      else console.log(`🎯 TRACE ${traceSku}: NOT FOUND in this cycle's ${allItems.length} items`);
     }
 
     const existingSkuCount = Object.keys(skuMap).length;
@@ -733,7 +737,7 @@ async function runSync(fullReset = false) {
       if (existing) { duplicateItemCodesInFeed++; if ((item.Available || 0) > (existing.Available || 0)) cosmoData[item.Item] = item; }
       else cosmoData[item.Item] = item;
     }
-    if (duplicateItemCodesInFeed > 0) console.log(`⚠️ Cosmopolitan's feed listed ${duplicateItemCodesInFeed} item code(s) more than once this cycle`);
+    if (duplicateItemCodesInFeed > 0) console.log(`⚠️ Cosmopolitan's feed listed ${duplicateItemCodesInFeed} item code(s) more than once`);
 
     const variantsByProduct = {};
     for (const sku of Object.keys(skuMap)) {
@@ -749,34 +753,29 @@ async function runSync(fullReset = false) {
       for (const v of variants) {
         const item = cosmoData[v.sku];
         const avail = item ? (item.Available || 0) : undefined;
-        if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: in bulk pass — found in cosmoData=${!!item}, Available=${item ? item.Available : "N/A"}, computed avail=${avail}, decision=${(avail === undefined || avail === 0) ? "OUT" : "IN"}`);
+        if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: bulk pass — found=${!!item}, Available=${item ? item.Available : "N/A"}, decision=${(avail === undefined || avail === 0) ? "OUT" : "IN"}`);
         if (avail === undefined || avail === 0) outVariants.push(v);
         else inVariants.push({ ...v, available: avail, net: item.Net, retail: item.Retail });
       }
       if (outVariants.length > 0 && inVariants.length > 0) {
-        console.log(`🔍 Mixed stock on product ${productId}: ${inVariants.length} size(s) in stock, ${outVariants.length} showing out (${outVariants.map(v => v.sku).join(", ")})`);
+        console.log(`🔍 Mixed stock on product ${productId}: ${inVariants.length} in stock, ${outVariants.length} out (${outVariants.map(v => v.sku).join(", ")})`);
       }
       if (outVariants.length === variants.length) {
         await setProductStatus(productId, "draft"); unpublished++; await sleep(200);
       } else {
         for (const v of outVariants) {
-          if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: about to DELETE this variant`);
           await deleteVariant(productId, v.variantId); variantsRemoved++; await sleep(200);
         }
         if (inVariants.length > 0) { await setProductStatus(productId, "active"); republished++; await sleep(200); }
       }
       for (const v of inVariants) {
-        if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: about to WRITE — variantId=${v.variantId}, inventoryItemId=${v.inventoryItemId}, target stock=${v.available}`);
         const freshDetail = await withRetry(() => fetchCosmoDetail(v.sku));
         let freshPrice, freshCompareAt;
         if (freshDetail) { freshPrice = calculatePrice(freshDetail.Net, freshDetail.Retail); freshCompareAt = freshDetail.Retail ? parseFloat(freshDetail.Retail).toFixed(2) : null; }
-        else { console.log(`⚠️ Could not fetch fresh price data for ${v.sku} — price left unchanged this cycle`); freshPrice = null; freshCompareAt = null; }
+        else { console.log(`⚠️ Could not fetch fresh price data for ${v.sku}`); freshPrice = null; freshCompareAt = null; }
         const writeResult = await updateInventory(v.variantId, v.inventoryItemId, v.available, locationId, freshPrice, freshCompareAt);
         if (TRACE_SKUS.includes(v.sku)) console.log(`🎯 TRACE ${v.sku}: WRITE RESULT — ${JSON.stringify(writeResult)}`);
 
-        // Catch-up: if this product currently has no real photo, check if
-        // Cosmopolitan has since added one — reuses freshDetail already fetched
-        // above, so this costs no extra API calls except when actually needed
         if (productHasRealImage[productId] === false) {
           const realUrl = getRealImageUrl(freshDetail);
           if (realUrl) {
@@ -787,14 +786,11 @@ async function runSync(fullReset = false) {
             );
             if (uploadRes.status === 200 || uploadRes.status === 201) {
               console.log(`🖼️ Caught up missing image for product ${productId} (${v.sku})`);
-              productHasRealImage[productId] = true; // don't re-upload for sibling variants this same cycle
-            } else {
-              console.log(`⚠️ Failed to catch up image for product ${productId}: status ${uploadRes.status}`);
-            }
+              productHasRealImage[productId] = true;
+            } else console.log(`⚠️ Failed to catch up image for product ${productId}: status ${uploadRes.status}`);
             await sleep(300);
           }
         }
-
         stockUpdated++; await sleep(250);
       }
     }
@@ -930,5 +926,5 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`🌸 Server running on port ${PORT}`);
   setInterval(() => runSync(), 45 * 60 * 1000);
-  setTimeout(() => runSync(), 5000); // auto-refreshes its own token now, no need to gate on the old static var
+  setTimeout(() => runSync(), 5000);
 });
