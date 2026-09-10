@@ -629,11 +629,13 @@ async function processOrders() {
     await sleep(300);
   }
   if (submitted > 0) {
-    const today = new Date().toISOString().split("T")[0].replace(/-/g, "");
+    // Include time (not just date) so this is always unique per sync run —
+    // no risk of two syncs on the same day submitting the same PO number
+    const timestamp = new Date().toISOString().replace(/[-:T.]/g, "").slice(0, 14);
     await request({ hostname: "api.cosmopolitanusa.com", path: "/v1/dropship", method: "POST",
       headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } },
-      { PO: `BLOOM-PO-${today}`, Comment: "Bloom Fragrances USA daily order" });
-    console.log(`✅ Dropship PO submitted`);
+      { PO: `BLOOM-PO-${timestamp}`, Comment: "Bloom Fragrances USA order batch" });
+    console.log(`✅ Dropship PO submitted: BLOOM-PO-${timestamp}`);
   }
 }
 async function syncTracking() {
