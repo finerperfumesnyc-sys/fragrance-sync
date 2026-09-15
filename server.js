@@ -589,9 +589,15 @@ async function processOrders() {
     const shipping = order.shipping_address;
     if (!shipping) continue;
 
+    // Generate the PO number up front so it can be included directly on the
+    // suborder itself, not just in a separate follow-up call
+    const orderTimestamp = new Date().toISOString().replace(/[-:T.]/g, "").slice(0, 14);
+    const poNumber = `BLOOM-PO-${order.order_number}-${orderTimestamp}`;
+
     // CRITICAL FIX: NET must be the WHOLESALE cost, not what the customer paid.
     // Fetch each item's real current wholesale price directly from Cosmopolitan
-    // at order time, instead of using the customer's Shopify price.
+    // at order time, instead of using the customer's Shopify price. Also
+    // include a product description on each line, not just the SKU.
     const lines = [];
     for (const item of order.line_items) {
       const detail = await withRetry(() => fetchCosmoDetail(item.sku));
@@ -602,14 +608,15 @@ async function processOrders() {
         console.log(`⚠️ Could not fetch wholesale price for ${item.sku} on order BLOOM-${order.order_number} — falling back to customer price, VERIFY THIS ORDER MANUALLY`);
         netPrice = parseFloat(item.price || 0).toFixed(2);
       }
+      const description = [item.title, item.variant_title].filter(Boolean).join(" - ") || (detail ? detail.Desc : "") || item.sku;
       lines.push({
-        SKU: item.sku, QTY: item.quantity, NET: netPrice,
+        SKU: item.sku, QTY: item.quantity, NET: netPrice, Description: description,
         EndPrice: shipping.country_code !== "US" ? parseFloat(item.price).toFixed(2) : undefined
       });
       await sleep(200);
     }
 
-    const suborder = { Suborder: `BLOOM-${order.order_number}`,
+    const suborder = { Suborder: `BLOOM-${order.order_number}`, PO: poNumber, ShipMethod: "USPSGA",
       ShipTo: { Name: `${shipping.first_name} ${shipping.last_name}`.trim(), Line1: shipping.address1, Line2: shipping.address2 || undefined,
         City: shipping.city, State: shipping.province_code, Zip: shipping.zip, Country: shipping.country_code,
         Phone: shipping.phone || undefined, Email: order.email || undefined, Residence: true },
@@ -617,27 +624,35 @@ async function processOrders() {
     const subRes = await request(
       { hostname: "api.cosmopolitanusa.com", path: "/v1/suborders", method: "POST",
         headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } }, suborder);
+
     if (subRes.status === 201 || subRes.status === 200) {
       submitted++;
-      console.log(`✅ Submitted order BLOOM-${order.order_number} (NET=wholesale cost, verified per-item)`);
+      console.log(`✅ Submitted order BLOOM-${order.order_number} with PO ${poNumber} (NET=wholesale cost, descriptions included)`);
       await request({ hostname: SHOPIFY_STORE, path: `/admin/api/2024-01/orders/${order.id}.json`, method: "PUT",
         headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } },
-        { order: { id: order.id, tags: ((order.tags || "") + ",cosmo-submitted").replace(/^,/, "") } });
+        { order: { id: order.id,
+            tags: ((order.tags || "") + ",cosmo-submitted").replace(/^,/, ""),
+            note: `${order.note ? order.note + " | " : ""}Cosmopolitan Suborder: BLOOM-${order.order_number} | PO: ${poNumber}`
+          } });
+
+      // Each order also gets its own independent dropship PO call, submitted
+      // right away — not batched with other orders
+      const poRes = await request({ hostname: "api.cosmopolitanusa.com", path: "/v1/dropship", method: "POST",
+        headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } },
+        { PO: poNumber, Comment: `Bloom Fragrances USA order BLOOM-${order.order_number}` });
+      if (poRes.status === 200 || poRes.status === 201) {
+        console.log(`✅ PO submitted for order BLOOM-${order.order_number}: ${poNumber}`);
+      } else {
+        console.log(`⚠️ Failed to submit PO for order BLOOM-${order.order_number}: status ${poRes.status} — ${JSON.stringify(poRes.body).slice(0, 200)}`);
+      }
+      await sleep(300);
     } else {
       console.log(`⚠️ Failed to submit order BLOOM-${order.order_number}: status ${subRes.status} — ${JSON.stringify(subRes.body).slice(0, 200)}`);
     }
     await sleep(300);
   }
-  if (submitted > 0) {
-    // Include time (not just date) so this is always unique per sync run —
-    // no risk of two syncs on the same day submitting the same PO number
-    const timestamp = new Date().toISOString().replace(/[-:T.]/g, "").slice(0, 14);
-    await request({ hostname: "api.cosmopolitanusa.com", path: "/v1/dropship", method: "POST",
-      headers: { Authorization: `CosmoToken ${COSMO_TOKEN}`, "Content-Type": "application/json" } },
-      { PO: `BLOOM-PO-${timestamp}`, Comment: "Bloom Fragrances USA order batch" });
-    console.log(`✅ Dropship PO submitted: BLOOM-PO-${timestamp}`);
-  }
 }
+
 async function syncTracking() {
   const res = await request({ hostname: SHOPIFY_STORE, path: "/admin/api/2024-01/orders.json?fulfillment_status=unfulfilled&status=open&limit=50",
     method: "GET", headers: { "X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json" } });
